@@ -1,0 +1,18 @@
+{
+  "backend": "external",
+  "base_url": "http://127.0.0.1:8081/v1",
+  "model": "dealignai/GLM-5.3-UNCENSORED-FP8",
+  "target_model": "dealignai/GLM-5.3-UNCENSORED-FP8",
+  "temperature": 0.7,
+  "max_tokens": 8192,
+  "system_prompt": "Ты полезный собеседник. Отвечай на языке пользователя.",
+  "show_reasoning": false,
+  "request_extra": {"reasoning_effort": "low"},
+  "tensor_parallel_size": 8,
+  "server": {
+    "executable": "vllm",
+    "context_size": 131072,
+    "startup_timeout": 1200,
+    "extra_args": []
+  }
+}

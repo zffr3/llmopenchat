@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# llmopenchat local state and credentials
+.venv/
+.venv-sft/
+.local/
+models/
+*.py[cod]
+config.json
+credits.txt
+whitelist.txt

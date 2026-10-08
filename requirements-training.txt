@@ -1,0 +1,9 @@
+# Optional training environment; install in a separate virtual environment.
+# Install a CUDA-enabled PyTorch build first when using a GPU.
+torch>=2.6,<3
+transformers>=5.19,<5.20
+trl>=1.14.2,<1.15
+peft>=0.21.2,<0.22
+datasets>=4.7,<5
+accelerate>=1.4,<2
+bitsandbytes>=0.50.2,<0.51

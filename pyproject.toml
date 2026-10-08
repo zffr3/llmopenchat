@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmopenchat"
+version = "0.1.0"
+description = "Local console chat with an automatically managed llama.cpp server"
+requires-python = ">=3.10"
+dependencies = ["huggingface_hub>=1.0,<2", "prompt_toolkit>=3.0,<4", "rich>=13.9,<15", "pypdf>=6.19,<7", "jsonschema>=4.25,<5"]
+
+[project.scripts]
+llmopenchat = "llmopenchat.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["llmopenchat*"]
+
+[tool.setuptools.package-data]
+llmopenchat = ["templates/*.jinja", "templates/LICENSE.*"]

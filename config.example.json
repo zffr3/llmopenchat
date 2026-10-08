@@ -1,0 +1,27 @@
+{
+  "backend": "llama_cpp",
+  "base_url": "http://127.0.0.1:8081/v1",
+  "model": "glm-local",
+  "target_model": "huihui_ai/glm-4.7-flash-abliterated",
+  "temperature": 0.7,
+  "max_tokens": 4096,
+  "system_prompt": "Ты полезный собеседник. Отвечай на языке пользователя.",
+  "show_reasoning": false,
+  "request_timeout": 600,
+  "request_extra": {"chat_template_kwargs": {"enable_thinking": false}},
+  "rag": {
+    "chunk_size": 1000,
+    "chunk_overlap": 150,
+    "top_k": 4,
+    "max_context_chars": 5000
+  },
+  "server": {
+    "executable": ".local/runtime/llama-b11445-vulkan/llama-server.exe",
+    "model_path": "models/huihui_ai--glm-4.7-flash-abliterated/Huihui-GLM-4.7-Flash-abliterated-ollama.Q4_K_M.llamacpp.gguf",
+    "context_size": 8192,
+    "gpu_layers": "auto",
+    "threads": 16,
+    "startup_timeout": 300,
+    "extra_args": ["--fit", "on", "--fit-target", "1024", "--chat-template-file", "llmopenchat/templates/GLM-4.7-Flash.jinja"]
+  }
+}
