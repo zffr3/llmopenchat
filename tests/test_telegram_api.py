@@ -8,7 +8,7 @@ from email.policy import default
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
-from llmopenchat.telegram_api import TelegramAPI, TelegramError, _NoRedirect
+from llmopenchat.telegram_api import MAX_DOWNLOAD_BYTES, TelegramAPI, TelegramError, _NoRedirect
 
 
 TOKEN = "123456:dummy-secret_for_tests"
@@ -151,6 +151,139 @@ class TelegramAPITests(unittest.TestCase):
         with patch("llmopenchat.telegram_api.MAX_DOCUMENT_BYTES", 2), self.assertRaises(TelegramError):
             self.api.send_document(10, "file", b"123")
         self.opener.open.assert_not_called()
+
+    def test_native_media_uploads_choose_method_field_and_content_type(self):
+        cases = (
+            ("document", "data.pdf", "sendDocument", "application/octet-stream"),
+            ("photo", "photo.JPG", "sendPhoto", "image/jpeg"),
+            ("video", "movie.mp4", "sendVideo", "video/mp4"),
+            ("audio", "song.mp3", "sendAudio", "audio/mpeg"),
+            ("voice", "voice.ogg", "sendVoice", "audio/ogg"),
+            ("animation", "image.gif", "sendAnimation", "image/gif"),
+            ("video_note", "note.mp4", "sendVideoNote", "video/mp4"),
+            ("sticker", "sticker.webp", "sendSticker", "image/webp"),
+        )
+        content = b"\x00\xffnative-media\r\n"
+        for media_type, filename, method, mime_type in cases:
+            with self.subTest(media_type=media_type):
+                self.opener.open.return_value = response({"message_id": 10})
+                caption = "Описание" if media_type not in {"sticker", "video_note"} else ""
+                result = self.api.send_media(42, filename, content, media_type=media_type, caption=caption)
+                request = self.opener.open.call_args.args[0]
+                self.assertEqual(request.full_url, f"https://api.telegram.org/bot{TOKEN}/{method}")
+                multipart = BytesParser(policy=default).parsebytes(
+                    f"Content-Type: {request.get_header('Content-type')}\r\n\r\n".encode() + request.data
+                )
+                parts = {part.get_param("name", header="content-disposition"): part for part in multipart.iter_parts()}
+                self.assertEqual(parts[media_type].get_content_type(), mime_type)
+                self.assertEqual(parts[media_type].get_payload(decode=True), content)
+                self.assertEqual(parts[media_type].get_filename(), filename)
+                self.assertEqual(parts["chat_id"].get_payload(decode=True), b"42")
+                if caption:
+                    self.assertEqual(parts["caption"].get_payload(decode=True).decode(), caption)
+                else:
+                    self.assertNotIn("caption", parts)
+                self.assertEqual(result, {"message_id": 10})
+
+    def test_native_media_validation_happens_before_upload(self):
+        invalid = (
+            {"media_type": "unknown"}, {"media_type": None}, {"media_type": []},
+            {"content": b""}, {"content": bytearray(b"x")},
+            {"filename": "folder/"}, {"filename": "."}, {"filename": ".."},
+            {"caption": None}, {"caption": "bad\ud800"},
+            {"media_type": "sticker", "caption": "unsupported"},
+            {"media_type": "video_note", "caption": "unsupported"},
+        )
+        for overrides in invalid:
+            args = {"filename": "file", "content": b"x", **overrides}
+            with self.subTest(overrides=overrides), self.assertRaises(TelegramError):
+                self.api.send_media(42, **args)
+        with patch("llmopenchat.telegram_api.MAX_PHOTO_BYTES", 2), self.assertRaises(TelegramError):
+            self.api.send_media(42, "photo.jpg", b"123", media_type="photo")
+        with patch("llmopenchat.telegram_api.MAX_DOCUMENT_BYTES", 2), self.assertRaises(TelegramError):
+            self.api.send_media(42, "video.mp4", b"123", media_type="video")
+        self.opener.open.assert_not_called()
+
+    def test_media_regenerates_boundary_if_content_collides(self):
+        self.opener.open.return_value = response({"message_id": 1})
+        content = b"llmopenchat-first\r\nraw"
+        with patch("llmopenchat.telegram_api.secrets.token_hex", side_effect=["first", "second"]):
+            self.api.send_media(42, "file", content)
+        request = self.opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Content-type"), "multipart/form-data; boundary=llmopenchat-second")
+        self.assertIn(content, request.data)
+
+    def test_download_file_uses_official_getfile_endpoint_and_exact_binary_bytes(self):
+        content = b"\x00\xffbinary\r\n"
+        self.opener.open.side_effect = [
+            response({"file_path": "photos/file_123.jpg", "file_size": len(content)}),
+            io.BytesIO(content),
+        ]
+        self.assertEqual(self.api.download_file("telegram-file-id", max_bytes=len(content)), content)
+        self.assertEqual(self.payload(), {"file_id": "telegram-file-id"})
+        request = self.opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, f"https://api.telegram.org/file/bot{TOKEN}/photos/file_123.jpg")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(self.opener.open.call_args.kwargs, {"timeout": 60})
+
+    def test_download_document_preserves_compatibility_and_optional_size(self):
+        self.opener.open.side_effect = [response({"file_path": "documents/file.bin"}), io.BytesIO(b"file")]
+        self.assertEqual(self.api.download_document("id", max_bytes=4), b"file")
+        with patch.object(self.api, "download_file", return_value=b"data") as download:
+            self.assertEqual(self.api.download_document("alias"), b"data")
+        download.assert_called_once_with("alias", max_bytes=MAX_DOWNLOAD_BYTES)
+
+    def test_download_rejects_invalid_id_and_limits_before_network(self):
+        for file_id in (None, "", "x" * 1025, 123):
+            with self.subTest(file_id=file_id), self.assertRaises(TelegramError):
+                self.api.download_file(file_id)
+        for max_bytes in (None, 0, -1, True, 1.5, MAX_DOWNLOAD_BYTES + 1):
+            with self.subTest(max_bytes=max_bytes), self.assertRaises(TelegramError):
+                self.api.download_file("id", max_bytes=max_bytes)
+        self.opener.open.assert_not_called()
+
+    def test_download_rejects_unsafe_paths_and_malformed_file_information(self):
+        cases = [None, [], {}, {"file_path": 123}]
+        cases.extend({"file_path": path} for path in (
+            "", "../secret", "/etc/passwd", "a//b", "a/./b", "a/../b",
+            "https://other.test/file", "a\\b", "a?b", "a#b", "a%2fb", "x" * 1025,
+        ))
+        cases.extend({"file_path": "file.bin", "file_size": size} for size in (-1, True, "3", 4))
+        for result in cases:
+            with self.subTest(result=result), self.assertRaises(TelegramError):
+                self.opener.open.reset_mock()
+                self.opener.open.return_value = response(result)
+                self.api.download_file("id", max_bytes=3)
+            self.assertEqual(self.opener.open.call_count, 1)
+
+    def test_download_enforces_actual_read_bound_and_detects_truncated_file(self):
+        for metadata, content in (
+            ({"file_path": "file.bin"}, b"1234"),
+            ({"file_path": "file.bin", "file_size": 3}, b"12"),
+        ):
+            with self.subTest(metadata=metadata), self.assertRaises(TelegramError):
+                self.opener.open.side_effect = [response(metadata), io.BytesIO(content)]
+                self.api.download_file("id", max_bytes=3)
+        bounded = Mock()
+        bounded.read.return_value = b"1234"
+        bounded.__enter__ = Mock(return_value=bounded)
+        bounded.__exit__ = Mock(return_value=None)
+        self.opener.open.side_effect = [response({"file_path": "file.bin"}), bounded]
+        with self.assertRaises(TelegramError):
+            self.api.download_file("id", max_bytes=3)
+        bounded.read.assert_called_once_with(4)
+
+    def test_download_transport_failure_redacts_secret_and_does_not_follow_redirects(self):
+        for error in (
+            URLError(f"https://api.telegram.org/file/bot{TOKEN}/file.bin"),
+            HTTPError(f"https://api.telegram.org/file/bot{TOKEN}/file.bin", 302, TOKEN, {}, None),
+        ):
+            self.opener.open.side_effect = [response({"file_path": "file.bin"}), error]
+            with self.subTest(error=type(error).__name__), self.assertRaises(TelegramError) as raised:
+                self.api.download_file("id")
+            self.assertNotIn(TOKEN, str(raised.exception))
+            self.assertNotIn("https://", str(raised.exception))
+            self.assertTrue(raised.exception.__suppress_context__)
 
     def test_api_failure_redacts_token_and_url_but_keeps_error_code(self):
         body = json.dumps({"ok": False, "error_code": 401, "description": f"Unauthorized {TOKEN} https://api.telegram.org/bot{TOKEN}/getMe"}).encode()

@@ -14,6 +14,7 @@ class HarnessStatus:
     last_tool: str = ""
     last_result: str = ""
     summary: dict | None = None
+    media_enabled: bool = False
 
     def configure(self, settings: HarnessSettings) -> None:
         if settings != self.settings:
@@ -43,7 +44,7 @@ class HarnessStatus:
     @property
     def enabled(self) -> bool:
         return (self.settings.code_enabled or self.settings.web_enabled
-                or self.settings.powershell_enabled or self.settings.http_enabled)
+                or self.settings.powershell_enabled or self.settings.http_enabled or self.media_enabled)
 
     def connection(self) -> str:
         if not self.enabled:
@@ -57,6 +58,8 @@ class HarnessStatus:
             names.append("PowerShell")
         if self.settings.http_enabled:
             names.append("HTTP")
+        if self.media_enabled and not names:
+            names.append("файлы Telegram")
         return "Харнес: " + "+".join(names) + " подключён"
 
     def activity(self) -> str:
@@ -79,12 +82,17 @@ class HarnessStatus:
             prefix = "ошибка / прервано · " if self.phase == "error" else ""
             http_warning = (" · HTTP-запрос мог быть выполнен; проверьте сервер"
                             if self.summary.get("uncertain_http_requests", 0) > 0 else "")
+            if self.summary.get("uncertain_file_sends", 0):
+                http_warning += " · отправка файла не подтверждена; проверьте Telegram"
             if not count:
                 return prefix + "модель не вызвала инструменты; изменений на диске нет" + http_warning
             counts = (f"вызовов: {count} · успешно: {self.summary.get('succeeded', 0)}"
                     f" · отказов: {self.summary.get('denied', 0)} · ошибок: {self.summary.get('failed', 0)}"
                     f" · файлов записано: {len(self.summary.get('files_written', []))}"
                     f" · успешно выполнено скриптов: {len(self.summary.get('scripts_run', []))}")
+            if self.media_enabled:
+                counts += (f" · файлов отправлено: {len(self.summary.get('files_sent', []))}"
+                           f" · скачано: {len(self.summary.get('files_downloaded', []))}")
             return (prefix + counts
                     + (" · возможны частичные изменения" if self.summary.get("uncertain_changes") else "")
                     + http_warning)
@@ -107,6 +115,8 @@ class HarnessStatus:
         lines.append("Код: " + ("включён" if self.settings.code_enabled else "выключен"))
         lines.append("PowerShell: " + ("включён" if self.settings.powershell_enabled else "выключен"))
         lines.append("HTTP: " + ("включён" if self.settings.http_enabled else "выключен"))
+        if self.media_enabled:
+            lines.append("Отправка файлов Telegram: подключена")
         if self.settings.code_enabled or self.settings.powershell_enabled:
             lines.append(f"Граница файлового доступа: {self.settings.repository}")
         if self.enabled:

@@ -139,19 +139,20 @@ class SharedTelegramTests(unittest.TestCase):
             reset.assert_not_called()
         self.assertEqual(self.api.documents, [])
 
-    def test_client_document_is_rejected_without_download_or_index_changes(self):
+    def test_client_document_is_saved_without_index_changes(self):
         user = self.send("/start")
         document = {"file_id": "private-file", "file_name": "notes.txt", "file_size": 10}
         update = message_update("", OTHER)
         update["message"]["document"] = document
         self.api.download_document = Mock(return_value=b"not imported")
-        with patch.object(self.bot, "add_document") as add:
+        with patch.object(user.rag, "command") as rag:
             self.bot.handle_update(update)
             self.join_worker()
-            add.assert_not_called()
-        self.api.download_document.assert_not_called()
-        self.assertFalse((user.workspace / "documents").exists())
-        self.assertIn("админ", self.api.messages[-1]["text"].casefold())
+            rag.assert_not_called()
+        self.api.download_document.assert_called_once()
+        self.assertEqual(len(list((user.workspace / "attachments").rglob("notes.txt"))), 1)
+        self.assertIn("Файл сохранён", self.api.messages[-1]["text"])
+        self.assertIn("notes.txt", user.messages[-1]["content"])
 
     def test_client_menu_and_help_expose_only_client_actions(self):
         for command in ("/start", "/menu"):

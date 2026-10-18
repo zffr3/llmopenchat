@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import mimetypes
 import re
 import secrets
 import threading
@@ -21,7 +22,8 @@ from .history import list_sessions, load_session, new_session_path, save_session
 from .models import ModelError, ModelManager
 from .rag import MAX_FILE_BYTES, SUPPORTED_SUFFIXES, RagSession
 from .runtime import ManagedServer, RuntimeErrorDetail
-from .telegram_api import TelegramAPI, TelegramError
+from .telegram_api import MAX_DOWNLOAD_BYTES, TelegramAPI, TelegramError
+from .telegram_media import AttachmentStore, TelegramToolHarness
 
 
 APPROVAL_TIMEOUT = 300.0
@@ -33,7 +35,8 @@ CLIENT_HELP = """/start — подключиться к общему диало�
 /help — команды
 /menu — главное меню
 /status — состояние бота
-Отправьте текст запроса. Модель и контекст диалога общие для всех клиентов.
+Отправьте текст, файл, фото, видео или аудио. Подпись к вложению — запрос модели.
+Модель и контекст диалога общие для всех клиентов.
 Запросы выполняются по очереди; ответ приходит отправителю запроса.
 Инструменты, репозиторий и общий диалог настраивает администратор.
 Вызовы инструментов подтверждает только администратор."""
@@ -55,6 +58,8 @@ ADMIN_HELP = """Режим admin + clients: одна модель, один ре
 /clear — очистить общий диалог, сохранив инструменты и репозиторий
 /cancel — отменить текущий общий запрос
 /quit, /exit — отменить запрос, очистить очередь и общий диалог
+Участники могут отправлять файлы и медиа; документы в RAG добавляет администратор.
+Для скачивания файлов по ссылкам включите HTTP; отправка файлов требует апрува.
 Ответы доставляются инициатору; каждый вызов инструмента подтверждается здесь.
 """
 HELP = """/start — открыть свой чат
@@ -83,7 +88,10 @@ HELP = """/start — открыть свой чат
 /cancel — отменить текущий запрос или апрув
 /quit или /exit — закрыть свой чат
 Каждый вызов харнеса требует отдельного апрува кнопкой.
-Документ, отправленный боту, добавляется в вашу базу знаний; /rag on — включить поиск.
+Можно отправлять файлы, фото, видео, аудио, голосовые и стикеры.
+Подпись к вложению — запрос модели; без подписи файл сохраняется для следующего запроса.
+Текст, PDF и DOCX также добавляются в RAG; /rag on — включить поиск.
+Для скачивания файлов по ссылкам: /tools http on. Отправка файлов требует апрува.
 Модель общая для бота; контекст, файлы, база знаний и доступы — персональные."""
 
 COMMANDS = [
@@ -171,6 +179,25 @@ def _relative_path(boundary: Path, value: str, *, directory: bool = False) -> Pa
     return result
 
 
+def _incoming_media(message: dict) -> dict | None:
+    """Normalize supported Telegram attachments, preferring the largest photo."""
+    photos = message.get("photo")
+    if isinstance(photos, list):
+        photos = [photo for photo in photos if isinstance(photo, dict)]
+        if photos:
+            def rank(photo):
+                width, height, size = (photo.get(key, 0) for key in ("width", "height", "file_size"))
+                area = width * height if type(width) is int and type(height) is int else 0
+                return area, size if type(size) is int else 0
+            return {**max(photos, key=rank), "media_type": "photo"}
+    # Telegram also includes document for animations for backward compatibility.
+    for kind in ("animation", "document", "video", "audio", "voice", "video_note", "sticker"):
+        media = message.get(kind)
+        if isinstance(media, dict):
+            return {**media, "media_type": kind}
+    return None
+
+
 @dataclass
 class UserChat:
     user_id: int
@@ -187,6 +214,8 @@ class UserChat:
     lock: threading.Lock = field(default_factory=threading.Lock)
     worker: threading.Thread | None = None
     request_user_id: int | None = None
+    media_store: AttachmentStore | None = None
+    media_queue: deque[tuple[int, str, dict]] = field(default_factory=deque)
 
     @property
     def sessions(self) -> Path:
@@ -524,7 +553,7 @@ class TelegramBot:
                 self.api.send_document(chat_id, "approval.txt", detail.encode("utf-8"),
                                        caption="Полные аргументы и содержимое для этого апрува")
                 detail = request.summary + "\n\nПолные детали — в файле approval.txt выше."
-            message = self._send(chat_id, "Апрув одного вызова\n\n" + detail
+            message = self._send(chat_id, "Апрув одного вызова: " + request.name + "\n\n" + detail
                                  + "\n\nБез ответа за 5 минут вызов будет отклонён.", {
                 "inline_keyboard": [[
                     {"text": "Разрешить", "callback_data": f"approve:{token}:yes"},
@@ -591,14 +620,15 @@ class TelegramBot:
                 or chat.get("type") != "private" or chat_id != user_id or sender.get("is_bot")):
             return
         self._remember_sender(sender)
-        document = message.get("document")
-        if isinstance(document, dict) and self.allowed(user_id):
-            self.dispatch(user_id, chat_id, "", document=document)
+        document = _incoming_media(message)
+        if document is not None and self.allowed(user_id):
+            caption = message.get("caption", "")
+            self.dispatch(user_id, chat_id, caption.strip() if isinstance(caption, str) else "", document=document)
             return
         text = message.get("text")
         if not isinstance(text, str) or not text.strip():
             if self.allowed(user_id):
-                self._send(chat_id, "Отправьте текст или команду /help.")
+                self._send(chat_id, "Отправьте текст, файл, фото, видео, аудио или команду /help.")
             return
         text = text.strip()
         if text.startswith("/"):
@@ -632,18 +662,18 @@ class TelegramBot:
             return
         if self.shared_mode:
             if not self.is_admin(user_id):
-                if document is not None or (text.startswith("/") and text.split(maxsplit=1)[0] not in CLIENT_COMMAND_NAMES):
+                if document is None and text.startswith("/") and text.split(maxsplit=1)[0] not in CLIENT_COMMAND_NAMES:
                     self._require_admin(chat_id)
                     return
-                if text.startswith("/"):
+                if document is None and text.startswith("/"):
                     self._client_command(chat_id, text)
                     return
             user = self.user_chat(user_id)
-            if text in {"/help", "/status"}:
+            if document is None and text in {"/help", "/status"}:
                 self.command(user, chat_id, text)
                 return
             with self.control_lock:
-                if text in {"/cancel", "/quit", "/exit"} and user.lock.locked():
+                if document is None and text in {"/cancel", "/quit", "/exit"} and user.lock.locked():
                     if user.request_user_id is None:
                         if text == "/cancel":
                             if self.shared_queue:
@@ -690,28 +720,59 @@ class TelegramBot:
                 user.worker.start()
             return
         user = self.user_chat(user_id)
-        if text in {"/cancel", "/quit", "/exit"} and user.lock.locked():
-            user.cancelled.set()
-            if text != "/cancel":
-                user.close_requested.set()
-            with self.control_lock:
+        with self.control_lock:
+            if document is None and text in {"/cancel", "/quit", "/exit"} and user.lock.locked():
+                user.cancelled.set()
+                had_pending_media = bool(user.media_queue)
+                user.media_queue.clear()
+                if text != "/cancel":
+                    user.close_requested.set()
                 client = self.clients.get(user_id)
                 if client is not None:
                     client.cancel()
                 for pending in self.approvals.values():
                     if pending.user_id == user_id:
                         pending.event.set()
-            self._send(chat_id, "Запрос отменяется; ваш чат будет закрыт."
-                       if text != "/cancel" else "Запрос отменяется.")
-            return
-        if not user.lock.acquire(blocking=False):
-            self._send(chat_id, "Предыдущий запрос ещё выполняется. Для отмены: /cancel.")
-            return
-        user.cancelled.clear()
-        arguments = (user, chat_id, text) if document is None else (user, chat_id, text, document)
-        user.worker = threading.Thread(target=self._work, args=arguments,
-                                       name=f"telegram-user-{user_id}", daemon=True)
-        user.worker.start()
+                self._send(chat_id, "Запрос отменяется; ваш чат будет закрыт."
+                           if text != "/cancel" else "Запрос отменяется."
+                           + (" Ожидающие вложения удалены из очереди." if had_pending_media else ""))
+                return
+            if not user.lock.acquire(blocking=False):
+                if document is not None:
+                    if user.cancelled.is_set() or user.close_requested.is_set():
+                        self._send(chat_id, "Дождитесь завершения отмены и повторите отправку вложения.")
+                    elif len(user.media_queue) >= MAX_SHARED_QUEUE:
+                        self._send(chat_id, "Очередь вложений заполнена. Повторите отправку позже.")
+                    else:
+                        user.media_queue.append((chat_id, text, document))
+                        self._send(chat_id, "Вложение добавлено в очередь и будет сохранено после текущего запроса.")
+                else:
+                    self._send(chat_id, "Предыдущий запрос ещё выполняется. Для отмены: /cancel.")
+                return
+            user.cancelled.clear()
+            arguments = (user, chat_id, text, document)
+            user.worker = threading.Thread(target=self._private_work, args=arguments,
+                                           name=f"telegram-user-{user_id}", daemon=True)
+            user.worker.start()
+
+    def _private_work(self, user: UserChat, chat_id: int, text: str, document: dict | None) -> None:
+        """Preserve albums/bursts while serializing file access with generation."""
+        released = False
+        try:
+            while True:
+                self._work(user, chat_id, text, document, release_lock=False)
+                with self.control_lock:
+                    if self._cancelled(user) or not user.media_queue:
+                        user.media_queue.clear()
+                        user.lock.release()
+                        released = True
+                        return
+                    chat_id, text, document = user.media_queue.popleft()
+        finally:
+            if not released:
+                with self.control_lock:
+                    user.media_queue.clear()
+                    user.lock.release()
 
     def _shared_work(self, user: UserChat) -> None:
         released = False
@@ -796,7 +857,7 @@ class TelegramBot:
         try:
             if not self._cancelled(user):
                 if document is not None:
-                    self.add_document(user, chat_id, document)
+                    self.add_document(user, chat_id, document, caption=text)
                 elif text.startswith("/"):
                     self.command(user, chat_id, text)
                 else:
@@ -847,7 +908,7 @@ class TelegramBot:
         if command == "/help":
             self._send(chat_id, ADMIN_HELP if self.shared_mode else HELP)
         elif command == "/status":
-            harness = user.harness_status or HarnessStatus(settings=user.settings)
+            harness = user.harness_status or HarnessStatus(settings=user.settings, media_enabled=True)
             self._send(chat_id, f"Модель: {self.runtime.config['target_model']}\n"
                        f"Рабочая директория: {user.workspace}\n"
                        + harness.details().replace("F3 — подключить", "/tools — подключить")
@@ -945,44 +1006,64 @@ class TelegramBot:
             [("Документы", "/rag list"), ("Состояние", "/status")],
         ])
 
-    def add_document(self, user: UserChat, chat_id: int, document: dict) -> None:
-        """Import an explicitly uploaded document into this user's knowledge base."""
-        if not self._require_admin(chat_id):
-            return
-        filename, file_id = document.get("file_name"), document.get("file_id")
+    def _media_store(self, user: UserChat) -> AttachmentStore:
+        if user.media_store is None:
+            user.media_store = AttachmentStore(user.workspace)
+        return user.media_store
+
+    def add_document(self, user: UserChat, chat_id: int, document: dict, *, caption: str = "") -> None:
+        """Save an uploaded attachment and make its handle available to the model."""
+        kind = document.get("media_type", "document")
+        extensions = {"document": ".bin", "photo": ".jpg", "video": ".mp4", "audio": ".mp3",
+                      "voice": ".ogg", "animation": ".mp4", "video_note": ".mp4", "sticker": ".webp"}
+        if not isinstance(kind, str) or kind not in extensions:
+            raise ValueError("Неподдерживаемый тип вложения Telegram.")
+        extension = extensions[kind]
+        if kind == "sticker":
+            extension = ".webm" if document.get("is_video") else ".tgs" if document.get("is_animated") else extension
+        filename = document.get("file_name") or kind + extension
+        file_id = document.get("file_id")
         if (not isinstance(filename, str) or not filename or len(filename) > 180
                 or "/" in filename or "\\" in filename):
-            raise ValueError("У документа должно быть обычное имя файла без пути.")
-        if not isinstance(file_id, str) or not file_id:
-            raise ValueError("Telegram не передал идентификатор документа.")
-        if Path(filename).suffix.casefold() not in SUPPORTED_SUFFIXES:
-            raise ValueError("Этот формат не поддерживается RAG. Отправьте текст, PDF или DOCX.")
+            raise ValueError("У вложения должно быть обычное имя файла без пути.")
+        _relative_path(user.workspace, filename)
+        if not isinstance(file_id, str) or not file_id or len(file_id) > 1024:
+            raise ValueError("Telegram не передал идентификатор файла.")
+        mime_type = document.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if not isinstance(mime_type, str) or not re.fullmatch(r"[\w.+-]+/[\w.+-]+", mime_type, flags=re.ASCII):
+            raise ValueError("Telegram передал некорректный MIME-тип файла.")
         size = document.get("file_size")
-        if size is not None and (type(size) is not int or not 0 <= size <= MAX_FILE_BYTES):
-            raise ValueError(f"Документ должен быть не больше {MAX_FILE_BYTES // (1024 * 1024)} МиБ.")
-        documents = user.workspace / "documents"
-        _relative_path(documents, filename)
-        _make_directory(documents, user.workspace)
-        path = _relative_path(documents, Path(filename).stem + "-" + secrets.token_hex(6) + Path(filename).suffix)
-        self._send(chat_id, "Добавляю документ в вашу базу знаний: " + filename + ". /cancel — отменить.")
+        if size is not None and (type(size) is not int or not 0 <= size <= MAX_DOWNLOAD_BYTES):
+            raise ValueError(f"Файл должен быть не больше {MAX_DOWNLOAD_BYTES // (1024 * 1024)} МиБ.")
+        self._send(chat_id, "Получаю файл: " + filename + ". /cancel — отменить.")
         try:
-            content = self.api.download_document(file_id, max_bytes=MAX_FILE_BYTES)
+            content = self.api.download_document(file_id, max_bytes=MAX_DOWNLOAD_BYTES)
         except TelegramError:
-            raise ValueError("Не удалось скачать документ из Telegram. Повторите отправку файла.") from None
+            raise ValueError("Не удалось скачать файл из Telegram. Повторите отправку файла.") from None
         if self._cancelled(user):
-            raise GenerationCancelled("Импорт документа отменён.")
-        if len(content) > MAX_FILE_BYTES:
-            raise ValueError("Документ превышает лимит размера RAG.")
-        _no_links(path, user.workspace)
-        with path.open("xb") as destination:
-            destination.write(content)
-        try:
-            result = user.rag.command("add " + str(path))
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
-        self._send(chat_id, result + "\n\nДокумент добавлен в вашу базу знаний. "
-                   + ("RAG включён." if user.rag.enabled else "/rag on — включить поиск в ответах."))
+            raise GenerationCancelled("Получение файла отменено.")
+        if len(content) > MAX_DOWNLOAD_BYTES:
+            raise ValueError("Файл превышает допустимый размер загрузки Telegram.")
+        store = self._media_store(user)
+        metadata = store.add(filename, content, media_type=kind, mime_type=mime_type)
+        notice = ""
+        if (kind == "document" and Path(filename).suffix.casefold() in SUPPORTED_SUFFIXES
+                and len(content) <= MAX_FILE_BYTES and (not self.shared_mode or self.is_admin(chat_id))):
+            try:
+                notice = "\n\n" + user.rag.command("add " + str(store.path(metadata["file_id"])))
+                notice += "\n" + ("RAG включён." if user.rag.enabled else "/rag on — включить поиск в ответах.")
+            except (OSError, ValueError) as error:
+                notice = f"\n\nФайл сохранён; не удалось добавить его в RAG: {error}"
+        prompt = (caption + "\n\n" if caption else "") + "[Вложение Telegram]\n" + json.dumps(metadata, ensure_ascii=False)
+        if caption:
+            self._send(chat_id, "Файл сохранён: " + filename + notice)
+            self.generate(user, chat_id, prompt)
+        else:
+            user.messages.append({"role": "user", "content": prompt})
+            self._save(user)
+            self._send(chat_id, f"Файл сохранён: {filename}\nfile_id: {metadata['file_id']}\n"
+                       "Теперь можно попросить модель использовать или отправить этот файл. "
+                       "Чтобы сразу задать запрос, отправляйте вложение с подписью." + notice)
 
     def tools(self, user: UserChat, chat_id: int, argument: str) -> None:
         if not self._require_admin(chat_id):
@@ -1112,7 +1193,7 @@ class TelegramBot:
             raise ValueError("/models: catalog, list, install ID [QUANT], use ПАКЕТ, remove ПАКЕТ.")
 
     def generate(self, user: UserChat, chat_id: int, prompt: str) -> None:
-        harness_status = HarnessStatus(settings=user.settings)
+        harness_status = HarnessStatus(settings=user.settings, media_enabled=True)
         user.harness_status = harness_status
         accepted = "Запрос выполняется в общей сессии." if self.shared_mode else "Запрос принят. /cancel — отменить."
         if harness_status.enabled:
@@ -1155,17 +1236,20 @@ class TelegramBot:
             allowed = self.approve(user, chat_id, request)
             harness_status.phase = "executing" if allowed else "result"
             return allowed
+        def send_file(filename, data, media_type, caption):
+            if self._cancelled(user):
+                error = HarnessError("Отправка файла отменена.")
+                error.send_started = False
+                raise error
+            return self.api.send_media(chat_id, filename, data, media_type=media_type, caption=caption)
         try:
             if self._cancelled(user):
                 raise GenerationCancelled("Запрос отменён.")
             config = copy.deepcopy(self.runtime.config)
             config["system_prompt"] = user.config["system_prompt"]
-            harness = ToolHarness(user.settings, approve) if (user.settings.web_enabled or user.settings.code_enabled
-                                                             or user.settings.powershell_enabled
-                                                             or user.settings.http_enabled) else None
-            if harness is not None:
-                user.settings = harness.settings
-                harness_status.configure(harness.settings)
+            harness = TelegramToolHarness(user.settings, approve, store=self._media_store(user), send=send_file)
+            user.settings = harness.settings
+            harness_status.configure(harness.settings)
             client = ApiClient(config)
             requester_id = user.request_user_id if self.shared_mode else user.user_id
             with self.control_lock:
@@ -1177,7 +1261,8 @@ class TelegramBot:
             user.messages = proposed + [{"role": "assistant", "content": result.answer}]
             self._save(user)
             text = ("[Рассуждение]\n" + "".join(reasoning) + "\n\n" if reasoning else "") + result.answer
-            if harness_status.enabled:
+            if (user.settings.web_enabled or user.settings.code_enabled or user.settings.powershell_enabled
+                    or user.settings.http_enabled or (harness_status.summary or {}).get("requested", 0)):
                 text += "\n\n" + harness_status.details()
             self._send(chat_id, text)
             if result.finish == "length":
@@ -1223,6 +1308,7 @@ class TelegramBot:
             self.shared_queue.clear()
             for user in self.users.values():
                 user.cancelled.set()
+                user.media_queue.clear()
             for pending in self.approvals.values():
                 pending.event.set()
             for client in self.clients.values():

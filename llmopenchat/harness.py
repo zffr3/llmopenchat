@@ -315,7 +315,8 @@ def _resolve_public(host: str, port: int, deadline: float) -> list[tuple]:
 
 
 def _exchange_public(url: str, *, method: str = "GET", headers: dict | None = None,
-                     body: bytes | None = None, web: bool = True) -> tuple[bytes, str] | dict:
+                     body: bytes | None = None, web: bool = True,
+                     binary_limit: int | None = None) -> tuple[bytes, str] | dict:
     parsed = urlsplit(url)
     host = parsed.hostname
     port = 443 if parsed.scheme == "https" else 80
@@ -387,7 +388,7 @@ def _exchange_public(url: str, *, method: str = "GET", headers: dict | None = No
         else:
             connection.request(method, target, body=body, headers=request_headers)
         response = connection.getresponse()
-        if web and 300 <= response.status < 400:
+        if (web or binary_limit is not None) and 300 <= response.status < 400:
             location = response.getheader("Location")
             message = "Сервер вернул перенаправление. Автоматический переход запрещён; для нового URL нужен отдельный вызов и апрув."
             if location:
@@ -396,7 +397,7 @@ def _exchange_public(url: str, *, method: str = "GET", headers: dict | None = No
                 except (HarnessError, ValueError):
                     message += " Адрес перенаправления небезопасен или некорректен."
             raise HarnessError(message)
-        if web and not 200 <= response.status < 300:
+        if (web or binary_limit is not None) and not 200 <= response.status < 300:
             raise HarnessError(f"Сервер вернул HTTP {response.status}.")
         response_headers = {}
         if not web:
@@ -414,20 +415,24 @@ def _exchange_public(url: str, *, method: str = "GET", headers: dict | None = No
         text_mime = mime.startswith("text/") or mime in {"application/json", "application/xml", "application/xhtml+xml", "application/javascript"}
         if not web:
             text_mime = text_mime or mime.endswith(("+json", "+xml")) or mime in {"application/x-ndjson", "application/x-www-form-urlencoded"}
-        if not no_body and not text_mime:
+        if not no_body and not text_mime and binary_limit is None:
             raise HarnessError("Разрешены только текстовые веб-ответы.")
+        byte_limit = MAX_WEB_BYTES if binary_limit is None else binary_limit
         length = response.getheader("Content-Length")
-        if not no_body and length is not None and (not length.isdecimal() or int(length) > MAX_WEB_BYTES):
-            raise HarnessError(f"Веб-ответ превышает лимит {MAX_WEB_BYTES} байт.")
-        content = b"" if no_body else response.read(MAX_WEB_BYTES + 1)
-        if len(content) > MAX_WEB_BYTES:
-            raise HarnessError(f"Веб-ответ превышает лимит {MAX_WEB_BYTES} байт.")
+        if not no_body and length is not None and (not length.isdecimal() or int(length) > byte_limit):
+            raise HarnessError(f"Веб-ответ превышает лимит {byte_limit} байт.")
+        content = b"" if no_body else response.read(byte_limit + 1)
+        if len(content) > byte_limit:
+            raise HarnessError(f"Веб-ответ превышает лимит {byte_limit} байт.")
         if not web and not no_body and length is not None and len(content) != int(length):
             raise HarnessError("HTTP-ответ оборвался до получения полного тела Content-Length.")
         if time.monotonic() >= deadline:
             raise HarnessError("Истекло время веб-запроса.")
         if web:
             return content, content_type
+        if binary_limit is not None:
+            return {"url": url, "status_code": response.status, "headers": response_headers,
+                    "content": content, "content_type": content_type, "request_started": True}
         charset = re.search(r"charset\s*=\s*[\"']?([\w-]+)", content_type, re.I)
         encoding = charset.group(1) if charset else "utf-8"
         try:
@@ -463,6 +468,14 @@ def _request_http_public(url: str, method: str, headers: dict, body: str) -> dic
         outgoing["Content-Type"] = "text/plain; charset=utf-8"
     return _exchange_public(url, method=method, headers=outgoing,
                             body=body.encode("utf-8") if body else None, web=False)
+
+
+def _download_http_public(url: str, headers: dict, limit: int) -> dict:
+    """Bounded binary GET over the same pinned public transport as HTTP tools."""
+    if type(limit) is not int or not 1 <= limit <= 50 * 1024 * 1024:
+        raise HarnessError("Недопустимый лимит загружаемого файла.")
+    _http_arguments({"method": "GET", "headers": headers, "body": ""})
+    return _exchange_public(_url(url), headers=dict(headers), web=False, binary_limit=limit)
 
 
 class _ReadableHTML(HTMLParser):

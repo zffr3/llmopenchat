@@ -16,12 +16,31 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 MAX_MESSAGE_UNITS = 4096
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_RATE_LIMIT_RETRIES = 2
 MAX_RATE_LIMIT_WAIT = 5
 _TOKEN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+\Z")
 _METHOD = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z")
 _URL = re.compile(r"https?://\S+", re.IGNORECASE)
+_MEDIA_METHODS = {
+    "document": "sendDocument",
+    "photo": "sendPhoto",
+    "video": "sendVideo",
+    "audio": "sendAudio",
+    "voice": "sendVoice",
+    "animation": "sendAnimation",
+    "video_note": "sendVideoNote",
+    "sticker": "sendSticker",
+}
+_MEDIA_MIME_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".gif": "image/gif", ".mp4": "video/mp4",
+    ".webm": "video/webm", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg",
+    ".tgs": "application/x-tgsticker",
+}
 
 
 class TelegramError(RuntimeError):
@@ -203,55 +222,79 @@ class TelegramAPI:
             },
         )
 
-    def download_document(self, file_id: str, *, max_bytes: int = 20 * 1024 * 1024) -> bytes:
+    def download_file(self, file_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
         """Download only a bounded file from the official getFile endpoint."""
         if (not isinstance(file_id, str) or not file_id or len(file_id) > 1024
-                or type(max_bytes) is not int or not 1 <= max_bytes <= 20 * 1024 * 1024):
-            raise TelegramError("Неверный ID документа или лимит загрузки Telegram.")
+                or type(max_bytes) is not int or not 1 <= max_bytes <= MAX_DOWNLOAD_BYTES):
+            raise TelegramError("Неверный ID файла или лимит загрузки Telegram.")
         result = self.call("getFile", {"file_id": file_id})
         if not isinstance(result, dict):
-            raise TelegramError("Telegram вернул неверные сведения о документе.")
+            raise TelegramError("Telegram вернул неверные сведения о файле.")
         path = result.get("file_path")
         size = result.get("file_size")
         if (not isinstance(path, str) or not path or len(path) > 1024
                 or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
                 or any(part in {"", ".", ".."} for part in path.split("/"))):
-            raise TelegramError("Telegram вернул неверный путь документа.")
+            raise TelegramError("Telegram вернул неверный путь файла.")
         if size is not None and (type(size) is not int or size < 0 or size > max_bytes):
-            raise TelegramError("Документ Telegram превышает допустимый размер загрузки.")
+            raise TelegramError("Файл Telegram превышает допустимый размер загрузки.")
         request = Request(f"https://api.telegram.org/file/bot{self._token}/{path}", method="GET")
         try:
             with self._opener.open(request, timeout=60) as response:
                 content = response.read(max_bytes + 1)
         except (URLError, OSError, HTTPException, ValueError):
-            raise TelegramError("Не удалось скачать документ из Telegram.") from None
+            raise TelegramError("Не удалось скачать файл из Telegram.") from None
         if len(content) > max_bytes:
-            raise TelegramError("Документ Telegram превышает допустимый размер загрузки.")
+            raise TelegramError("Файл Telegram превышает допустимый размер загрузки.")
         if size is not None and len(content) != size:
-            raise TelegramError("Документ Telegram загружен не полностью.")
+            raise TelegramError("Файл Telegram загружен не полностью.")
         return content
+
+    def download_document(self, file_id: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+        """Backward-compatible name for downloading any Telegram file."""
+        return self.download_file(file_id, max_bytes=max_bytes)
 
     def send_document(
         self, chat_id: int | str, filename: str, content: bytes, caption: str = ""
     ) -> dict:
+        return self.send_media(chat_id, filename, content, media_type="document", caption=caption)
+
+    def send_media(
+        self, chat_id: int | str, filename: str, content: bytes, *,
+        media_type: str = "document", caption: str = "",
+    ) -> dict:
         """Upload supplied bytes; the filename is a label, never a local file path."""
-        if not isinstance(content, bytes) or len(content) > MAX_DOCUMENT_BYTES:
-            raise TelegramError("Документ Telegram должен содержать bytes размером до 50 МБ.")
+        if not isinstance(media_type, str) or media_type not in _MEDIA_METHODS:
+            raise TelegramError("Неподдерживаемый тип медиа Telegram.")
+        limit = MAX_PHOTO_BYTES if media_type == "photo" else MAX_DOCUMENT_BYTES
+        if not isinstance(content, bytes) or not content or len(content) > limit:
+            raise TelegramError(
+                f"Файл Telegram должен содержать непустые bytes размером до {limit // (1024 * 1024)} МБ."
+            )
         if not isinstance(filename, str) or not filename:
-            raise TelegramError("Документ Telegram должен иметь имя файла.")
+            raise TelegramError("Медиа Telegram должно иметь имя файла.")
         filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
-        filename = "".join("_" if char == '"' or ord(char) < 32 else char for char in filename)
-        if not filename:
-            raise TelegramError("Документ Telegram должен иметь имя файла.")
+        filename = "".join("_" if char == '"' or ord(char) < 32 or ord(char) == 127 else char for char in filename)
+        if not filename or filename in {".", ".."}:
+            raise TelegramError("Медиа Telegram должно иметь имя файла.")
         caption = _split_text(caption, 1024)[0]
+        supports_caption = media_type not in {"video_note", "sticker"}
+        if caption and not supports_caption:
+            raise TelegramError("Этот тип медиа Telegram не поддерживает подпись.")
+        mime_type = "application/octet-stream"
+        if media_type != "document":
+            dot = filename.rfind(".")
+            mime_type = _MEDIA_MIME_TYPES.get(filename[dot:].lower(), mime_type) if dot >= 0 else mime_type
         try:
-            fields = {"chat_id": str(chat_id).encode("utf-8"), "caption": caption.encode("utf-8")}
+            fields = {"chat_id": str(chat_id).encode("utf-8")}
+            if supports_caption:
+                fields["caption"] = caption.encode("utf-8")
             file_header = (
-                f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-                "Content-Type: application/octet-stream\r\n\r\n"
+                f'Content-Disposition: form-data; name="{media_type}"; filename="{filename}"\r\n'
+                f"Content-Type: {mime_type}\r\n\r\n"
             ).encode("utf-8")
         except UnicodeError:
-            raise TelegramError("Документ Telegram содержит некорректный Unicode.") from None
+            raise TelegramError("Медиа Telegram содержит некорректный Unicode.") from None
         boundary = "llmopenchat-" + secrets.token_hex(16)
         delimiter = boundary.encode("ascii")
         while delimiter in content or delimiter in file_header or any(delimiter in value for value in fields.values()):
@@ -269,14 +312,14 @@ class TelegramAPI:
             )
         parts.extend([b"--" + delimiter + b"\r\n", file_header, content, b"\r\n--" + delimiter + b"--\r\n"])
         request = Request(
-            f"https://api.telegram.org/bot{self._token}/sendDocument",
+            f"https://api.telegram.org/bot{self._token}/{_MEDIA_METHODS[media_type]}",
             data=b"".join(parts),
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             method="POST",
         )
         result = self._perform(request, timeout=30)
         if not isinstance(result, dict):
-            raise TelegramError("Telegram Bot API вернул некорректные данные документа.")
+            raise TelegramError("Telegram Bot API вернул некорректные данные медиа.")
         return result
 
     def edit_message_reply_markup(

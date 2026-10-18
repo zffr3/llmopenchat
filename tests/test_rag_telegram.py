@@ -15,6 +15,7 @@ from llmopenchat.history import load_session
 from llmopenchat.rag import MAX_FILE_BYTES
 from llmopenchat.telegram import TelegramBot
 from llmopenchat.telegram_api import TelegramError
+from llmopenchat.telegram_api import MAX_DOWNLOAD_BYTES
 
 
 def update(user_id, text=None, *, document=None, username=None):
@@ -194,21 +195,21 @@ class TelegramRagTests(unittest.TestCase):
         document = {"file_id": "telegram-file", "file_name": "notes.txt", "file_size": 70}
         user = self.send(document=document)
         self.assertFalse(user.rag.enabled)
-        self.assertIn("notes-", user.rag.command("list"))
-        uploaded = list((user.workspace / "documents").glob("*.txt"))
+        self.assertIn("notes.txt", user.rag.command("list"))
+        uploaded = list((user.workspace / "attachments").rglob("notes.txt"))
         self.assertEqual(len(uploaded), 1)
         self.assertEqual(uploaded[0].read_bytes(), self.api.content)
-        self.assertNotIn("notes-", self.bot.user_chat(202).rag.command("list"))
-        self.assertEqual(self.api.downloads, [("telegram-file", MAX_FILE_BYTES)])
+        self.assertNotIn("notes.txt", self.bot.user_chat(202).rag.command("list"))
+        self.assertEqual(self.api.downloads, [("telegram-file", MAX_DOWNLOAD_BYTES)])
         self.assertIn("/rag on", self.api.messages[-1]["text"])
         self.send(document=document)
-        self.assertEqual(len(list((user.workspace / "documents").glob("*.txt"))), 2)
+        self.assertEqual(len(list((user.workspace / "attachments").rglob("notes.txt"))), 2)
 
-    def test_upload_rejects_paths_unsupported_formats_and_size_before_downloading(self):
+    def test_upload_rejects_paths_and_telegram_size_before_downloading(self):
         base = {"file_id": "telegram-file", "file_name": "notes.txt", "file_size": 70}
         invalid = [{**base, "file_name": value} for value in
-                   ("../notes.txt", "nested/notes.txt", "C:\\notes.txt", "notes.exe", "con.txt")]
-        invalid += [{**base, "file_size": MAX_FILE_BYTES + 1}, {**base, "file_size": True},
+                   ("../notes.txt", "nested/notes.txt", "C:\\notes.txt", "con.txt")]
+        invalid += [{**base, "file_size": MAX_DOWNLOAD_BYTES + 1}, {**base, "file_size": True},
                     {**base, "file_id": ""}]
         for document in invalid:
             with self.subTest(document=document):
@@ -221,7 +222,7 @@ class TelegramRagTests(unittest.TestCase):
         self.assertFalse(self.api.downloads)
         self.assertNotIn(101, self.bot.users)
 
-    def test_upload_respects_active_user_lock(self):
+    def test_upload_waits_in_queue_while_user_lock_is_active(self):
         user = self.bot.user_chat(101)
         user.lock.acquire()
         try:
@@ -229,7 +230,8 @@ class TelegramRagTests(unittest.TestCase):
         finally:
             user.lock.release()
         self.assertFalse(self.api.downloads)
-        self.assertIn("Предыдущий запрос", self.api.messages[-1]["text"])
+        self.assertIn("Вложение добавлено в очередь", self.api.messages[-1]["text"])
+        self.assertEqual(len(user.media_queue), 1)
 
     def test_upload_rechecks_access_after_download(self):
         user = self.bot.user_chat(101)
@@ -238,22 +240,31 @@ class TelegramRagTests(unittest.TestCase):
             return self.api.content
         with patch.object(self.api, "download_document", side_effect=download):
             self.send(document={"file_id": "secret", "file_name": "notes.txt"})
-        self.assertFalse(list((user.workspace / "documents").glob("*.txt")))
-        self.assertNotIn("notes-", user.rag.command("list"))
+        self.assertFalse(list((user.workspace / "attachments").rglob("notes.txt")))
+        self.assertNotIn("notes.txt", user.rag.command("list"))
 
-    def test_upload_failed_import_removes_unindexed_copy(self):
+    def test_upload_failed_rag_import_preserves_attachment_for_file_tools(self):
         user = self.bot.user_chat(101)
         with patch.object(user.rag, "command", side_effect=ValueError("Invalid document")):
             self.send(document={"file_id": "secret", "file_name": "notes.txt"})
-        self.assertFalse(list((user.workspace / "documents").glob("*.txt")))
-        self.assertIn("Ошибка", self.api.messages[-1]["text"])
+        self.assertEqual(len(list((user.workspace / "attachments").rglob("notes.txt"))), 1)
+        self.assertIn("не удалось добавить его в RAG", self.api.messages[-1]["text"])
+        self.assertIn("file_id", user.messages[-1]["content"])
 
     def test_upload_download_failure_is_reported_without_transport_details(self):
         with patch.object(self.api, "download_document", side_effect=TelegramError("private transport detail")):
             user = self.send(document={"file_id": "secret", "file_name": "notes.txt"})
-        self.assertIn("Не удалось скачать документ", self.api.messages[-1]["text"])
+        self.assertIn("Не удалось скачать файл", self.api.messages[-1]["text"])
         self.assertNotIn("private transport detail", self.api.messages[-1]["text"])
-        self.assertFalse(list((user.workspace / "documents").glob("*.txt")))
+        self.assertFalse(list((user.workspace / "attachments").rglob("notes.txt")))
+
+    def test_non_rag_file_is_stored_and_available_in_history(self):
+        user = self.send(document={"file_id": "archive", "file_name": "archive.zip"})
+        saved = list((user.workspace / "attachments").rglob("archive.zip"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), self.api.content)
+        self.assertNotIn("archive.zip", user.rag.command("list"))
+        self.assertIn("archive.zip", load_session(user.directory / "current.json")[-1]["content"])
 
 
 if __name__ == "__main__":

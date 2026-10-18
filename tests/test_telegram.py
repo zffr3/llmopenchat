@@ -567,7 +567,7 @@ class TelegramBotTests(unittest.TestCase):
                 self.requests = []
                 clients.append(self)
 
-            def stream_chat(self, messages):
+            def stream_chat(self, messages, tools=None, tool_choice=None):
                 self.requests.append(copy.deepcopy(messages))
                 yield StreamEvent("reasoning", "Мысль")
                 yield StreamEvent("content", "Ответ: " + messages[-1]["content"])
@@ -726,7 +726,8 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(approve.call_count, 1)
         self.assertEqual(approve.call_args.args[-1].name, "powershell_run")
-        self.assertEqual([item["function"]["name"] for item in client.requests[0][1]], ["powershell_run"])
+        self.assertEqual([item["function"]["name"] for item in client.requests[0][1]],
+                         ["powershell_run", "telegram_send_file"])
         reply = self.api.messages[-1]["text"]
         self.assertIn("PowerShell подключён", reply)
         self.assertIn("успешно: 1", reply)
@@ -763,7 +764,8 @@ class TelegramBotTests(unittest.TestCase):
             self.bot.handle_update(callback_update(data, message["message_id"]))
             self.join_worker()
         request.assert_called_once_with(arguments["url"], arguments["method"], arguments["headers"], arguments["body"])
-        self.assertEqual([item["function"]["name"] for item in client.requests[0][1]], ["http_request"])
+        self.assertEqual([item["function"]["name"] for item in client.requests[0][1]],
+                         ["http_request", "telegram_send_file", "http_download"])
         response = json.loads(client.requests[1][0][-1]["content"])
         self.assertEqual(response["status_code"], 201)
         self.assertEqual(response["body"], '{"id":7}')
