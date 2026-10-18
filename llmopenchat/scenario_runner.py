@@ -18,7 +18,7 @@ from .scenarios import Scenario, ScenarioError
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS = 32
-_NETWORK_TOOLS = frozenset({"web_fetch", "web_search"})
+_NETWORK_TOOLS = frozenset({"web_fetch", "web_search", "http_request"})
 
 
 class _NoRedirect(HTTPRedirectHandler):

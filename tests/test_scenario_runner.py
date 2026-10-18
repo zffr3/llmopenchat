@@ -183,6 +183,70 @@ class ScenarioRunnerTests(unittest.TestCase):
         self.assertIsNone(instances[0].received_identity)
         self.assertEqual([instance.received_identity for instance in instances[1:]], [(1, 2, 3), (1, 2, 3)])
 
+    def test_http_tool_is_exposed_and_approved_independently(self):
+        preset = definition(harness=ScenarioHarness(http_enabled=True, auto_approve=frozenset({"http_request"})))
+        arguments = json.dumps({"method": "POST", "url": "https://example.com/api", "headers": {
+            "Content-Type": "application/json",
+        }, "body": '{"message":"новость"}'}, ensure_ascii=False)
+        client = FakeClient([tool_round(tool(name="http_request", arguments=arguments)), final()])
+        harness, instances = self.fake_harness(("web_fetch", "http_request"))
+        with patch.object(scenario_runner, "ToolHarness", harness):
+            self.assertEqual(ScenarioRunner(preset, client).run("Новость"), VALUE)
+        schemas = client.requests[0]["tools"]
+        self.assertEqual([schema["function"]["name"] for schema in schemas], ["http_request"])
+        self.assertIn("preauthorized", schemas[0]["function"]["description"])
+        self.assertNotIn("human approval", schemas[0]["function"]["description"])
+        self.assertTrue(instances[-1].settings.http_enabled)
+        self.assertFalse(instances[-1].settings.web_enabled)
+        self.assertEqual(instances[-1].executed, [("http_request", arguments)])
+        self.assertEqual(json.loads(client.requests[1]["messages"][-1]["content"])["status"], "ok")
+
+    def test_http_without_autoapproval_is_not_offered_or_executed(self):
+        preset = definition(harness=ScenarioHarness(http_enabled=True))
+        client = FakeClient([tool_round(tool(name="http_request", arguments='{"method":"GET","url":"https://example.com/"}'))])
+        harness, instances = self.fake_harness(("http_request",))
+        with patch.object(scenario_runner, "ToolHarness", harness), self.assertRaises(ScenarioError):
+            ScenarioRunner(preset, client).run("Новость")
+        self.assertIsNone(client.requests[0]["tools"])
+        self.assertEqual(instances[-1].executed, [])
+
+    def test_http_requests_outside_hosts_are_denied_without_network(self):
+        preset = definition(harness=ScenarioHarness(http_enabled=True, auto_approve=frozenset({"http_request"})))
+        calls = [tool(f"call-{index}", "http_request", json.dumps({"method": "POST", "url": url, "body": "data"}))
+                 for index, url in enumerate(("https://other.invalid/api", "http://example.com/api"))]
+        client = FakeClient([tool_round(*calls), final()])
+        with (patch.object(harness_module, "_resolve_public") as resolve,
+              patch.object(harness_module.socket, "socket") as connect):
+            self.assertEqual(ScenarioRunner(preset, client).run("Новость"), VALUE)
+        resolve.assert_not_called()
+        connect.assert_not_called()
+        tool_results = client.requests[1]["messages"][-2:]
+        self.assertEqual([json.loads(result["content"])["status"] for result in tool_results], ["denied", "denied"])
+
+    def test_allowlisted_http_runs_real_harness_and_returns_status_to_model(self):
+        preset = definition(harness=ScenarioHarness(http_enabled=True, auto_approve=frozenset({"http_request"})))
+        arguments = {"method": "PATCH", "url": "https://example.com/api", "headers": {
+            "Content-Type": "application/json", "Authorization": "Bearer provided-token",
+        }, "body": '{"message":"новость"}'}
+        client = FakeClient([tool_round(tool(name="http_request", arguments=json.dumps(arguments, ensure_ascii=False))), final()])
+        response = {"status_code": 422, "headers": {"content-type": "application/json"}, "body": '{"error":"invalid"}'}
+        with patch.object(harness_module, "_request_http_public", return_value=response) as request:
+            self.assertEqual(ScenarioRunner(preset, client).run("Новость"), VALUE)
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args, (arguments["url"], "PATCH", arguments["headers"], arguments["body"]))
+        result = json.loads(client.requests[1]["messages"][-1]["content"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["status_code"], 422)
+        self.assertEqual(result["body"], response["body"])
+
+    def test_http_autoapproval_does_not_enable_disabled_http_capability(self):
+        preset = definition(harness=ScenarioHarness(web_enabled=True, auto_approve=frozenset({"http_request"})))
+        client = FakeClient([tool_round(tool(name="http_request", arguments='{"url":"https://example.com/"}'))])
+        with patch.object(harness_module, "_request_http_public") as request, self.assertRaises(ScenarioError):
+            ScenarioRunner(preset, client).run("Новость")
+        self.assertIsNone(client.requests[0]["tools"])
+        request.assert_not_called()
+
     def test_web_requests_outside_hosts_are_denied_without_network(self):
         preset = definition(harness=ScenarioHarness(web_enabled=True, auto_approve=frozenset({"web_fetch", "web_search"})))
         calls = [tool("call-fetch", arguments='{"url":"https://other.invalid/news"}'),

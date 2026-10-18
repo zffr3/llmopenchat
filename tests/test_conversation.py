@@ -99,7 +99,8 @@ class ConversationTests(unittest.TestCase):
         result = generate_response(client, messages, on_event=received.append)
         self.assertEqual([event for event in received if event not in self.control_events(received)], events)
         self.assertEqual(self.progress(received), {"requested": 0, "succeeded": 0, "denied": 0, "failed": 0,
-                         "files_written": [], "directories_created": [], "no_changes": True, "uncertain_changes": False, "scripts_run": []})
+                         "files_written": [], "directories_created": [], "no_changes": True, "uncertain_changes": False,
+                         "scripts_run": [], "uncertain_http_requests": 0})
         self.assertEqual(result.answer, "Ответ")
         self.assertEqual(result.usage, {"completion_tokens": 3})
         self.assertEqual(result.finish, "length")
@@ -288,7 +289,7 @@ class ConversationTests(unittest.TestCase):
         self.assert_saveable(messages)
         self.assertEqual(self.progress(events), {"requested": 1, "succeeded": 1, "denied": 0, "failed": 0,
                          "files_written": ["src/Program.cs"], "directories_created": ["src"],
-                         "no_changes": False, "uncertain_changes": False, "scripts_run": []})
+                         "no_changes": False, "uncertain_changes": False, "scripts_run": [], "uncertain_http_requests": 0})
         self.assertEqual(next(event.value for event in events if event.kind == "tool_start"),
                          {"id": "call-1", "name": "write_file", "arguments": {"path": "src/Program.cs", "content": source}})
         self.assertEqual(next(event.value for event in events if event.kind == "tool_result")["status"], "ok")
@@ -427,6 +428,42 @@ class ConversationTests(unittest.TestCase):
                 self.assertIn("не подтверждено", result.answer)
                 self.assertEqual(self.progress(events)["scripts_run"], [])
                 self.assertEqual(self.progress(events)["succeeded"], 0)
+
+    def test_http_errors_report_remote_uncertainty_without_retries_or_file_mutations(self):
+        for value, uncertain in (({"status": "denied"}, 0),
+                                 ({"status": "error", "request_started": False}, 0),
+                                 ({"status": "error", "request_started": True}, 1),
+                                 ({"status": "ok", "status_code": 422, "body": "rejected"}, 0)):
+            with self.subTest(value=value):
+                harness = Harness(lambda name, raw: json.dumps(value), ["http_request"])
+                client = Client(tool_round(call(name="http_request", arguments='{"url":"https://example.com/","method":"POST","body":"change"}')),
+                                final_round("Результат обработан."))
+                messages = [{"role": "user", "content": "Отправь POST"}]
+                events = []
+                generate_response(client, messages, harness, events.append)
+                self.assertEqual(len(harness.executed), 1)
+                self.assertEqual(client.choices, [None, None])
+                self.assertEqual(self.progress(events)["uncertain_http_requests"], uncertain)
+                self.assertFalse(self.progress(events)["uncertain_changes"])
+                self.assertEqual(self.progress(events)["files_written"], [])
+                runtime = client.requests[0][0][0]["content"]
+                self.assertIn("request_started=true", runtime)
+                self.assertNotIn(runtime, [message.get("content") for message in messages])
+                self.assert_saveable(messages)
+
+    def test_interrupted_http_request_preserves_uncertainty_in_history(self):
+        def interrupted(name, raw):
+            raise KeyboardInterrupt
+        harness = Harness(interrupted, ["http_request"])
+        client = Client(tool_round(call(name="http_request", arguments='{"url":"https://example.com/"}')))
+        messages = [{"role": "user", "content": "Отправь запрос"}]
+        events = []
+        with self.assertRaises(KeyboardInterrupt):
+            generate_response(client, messages, harness, events.append)
+        self.assertEqual(self.progress(events)["uncertain_http_requests"], 1)
+        self.assertFalse(self.progress(events)["uncertain_changes"])
+        self.assertTrue(json.loads(messages[-1]["content"])["request_started"])
+        self.assert_saveable(messages)
 
 
 if __name__ == "__main__":

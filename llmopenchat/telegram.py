@@ -43,7 +43,8 @@ ADMIN_HELP = """Режим admin + clients: одна модель, один ре
 /id — мой Telegram ID
 /help — команды
 /status — состояние общей сессии и инструментов
-/tools — подключить веб, код и PowerShell
+/tools — подключить веб, код, PowerShell и HTTP
+/tools http on|off — HTTP(S)-запросы к публичным адресам
 /tools repo ПАПКА — общий репозиторий (абсолютный путь или путь от корня проекта)
 /models — каталог, установка и выбор общей модели
 /system ТЕКСТ — системная инструкция и новый общий диалог
@@ -72,10 +73,11 @@ HELP = """/start — открыть свой чат
 /rag on|off — отвечать с поиском по своим документам
 /rag add ФАЙЛ — добавить файл из своей рабочей директории
 /rag list|remove ID|search ЗАПРОС|clear — управление базой знаний
-/tools — подключить веб, код и PowerShell кнопками
+/tools — подключить веб, код, PowerShell и HTTP кнопками
 /tools web on|off — веб
 /tools code on|off — код в своей рабочей директории
 /tools powershell on|off — ограниченный PowerShell в своей рабочей директории
+/tools http on|off — HTTP(S)-запросы к публичным адресам
 /tools repo ПАПКА — подпапка своей рабочей директории
 /tools off — отключить все харнесы
 /cancel — отменить текущий запрос или апрув
@@ -399,7 +401,7 @@ class TelegramBot:
             values = json.loads(content)
             if not isinstance(values, dict):
                 raise ValueError("Неверные настройки общего Telegram-чата.")
-        for name in ("web_enabled", "code_enabled", "powershell_enabled", "rag_enabled", "show_reasoning"):
+        for name in ("web_enabled", "code_enabled", "powershell_enabled", "http_enabled", "rag_enabled", "show_reasoning"):
             if name in values and type(values[name]) is not bool:
                 raise ValueError("Неверный переключатель в настройках общего Telegram-чата.")
         repository = values.get("repository")
@@ -419,6 +421,7 @@ class TelegramBot:
         settings = HarnessSettings(web_enabled=values.get("web_enabled", False),
                                    code_enabled=values.get("code_enabled", False),
                                    powershell_enabled=values.get("powershell_enabled", False),
+                                   http_enabled=values.get("http_enabled", False),
                                    repository=selected, repository_identity=tuple(identity) if identity else None)
         if settings.code_enabled or settings.powershell_enabled:
             settings = ToolHarness(settings, lambda request: False).settings
@@ -432,6 +435,7 @@ class TelegramBot:
         settings = user.settings
         values = {"web_enabled": settings.web_enabled, "code_enabled": settings.code_enabled,
                   "powershell_enabled": settings.powershell_enabled,
+                  "http_enabled": settings.http_enabled,
                   "repository": str(settings.repository) if settings.repository else None,
                   "repository_identity": settings.repository_identity, "rag_enabled": user.rag.enabled,
                   "show_reasoning": bool(user.config.get("show_reasoning"))}
@@ -986,7 +990,7 @@ class TelegramBot:
         action, _, value = argument.partition(" ")
         value = value.strip()
         settings = user.settings
-        if action in {"web", "code", "powershell"}:
+        if action in {"web", "code", "powershell", "http"}:
             if value not in {"on", "off"}:
                 raise ValueError(f"Укажите /tools {action} on или off.")
             settings = replace(settings, **{action + "_enabled": value == "on"})
@@ -1003,7 +1007,7 @@ class TelegramBot:
         elif action == "off":
             settings = HarnessSettings(repository=settings.repository, repository_identity=settings.repository_identity) if self.shared_mode else HarnessSettings()
         elif action:
-            raise ValueError("/tools: web on|off, code on|off, powershell on|off, repo ПАПКА или off.")
+            raise ValueError("/tools: web on|off, code on|off, powershell on|off, http on|off, repo ПАПКА или off.")
         if settings.code_enabled or settings.powershell_enabled:
             checked = ToolHarness(settings, lambda request: False)
             settings = checked.settings
@@ -1013,9 +1017,11 @@ class TelegramBot:
                    f"Веб: {'включён' if settings.web_enabled else 'выключен'}\n"
                    f"Код: {'включён' if settings.code_enabled else 'выключен'}\n"
                    f"PowerShell: {'включён' if settings.powershell_enabled else 'выключен'}\n"
+                   f"HTTP: {'включён' if settings.http_enabled else 'выключен'}\n"
                    f"Директория: {settings.repository or user.workspace}\n"
-                   "Каждое чтение, поиск, запись, создание каталога, веб-запрос и запуск PowerShell требуют апрува.\n"
+                   "Каждое чтение, поиск, запись, создание каталога, веб/HTTP-запрос и запуск PowerShell требуют апрува.\n"
                    "PowerShell: только вычисления и вывод; файловые команды, сеть и другие программы запрещены.\n"
+                   "HTTP: публичные HTTP(S)-адреса на стандартных портах, без перенаправлений.\n"
                    + ("/tools repo ПАПКА — общий репозиторий: абсолютный путь или путь от корня проекта." if self.shared_mode
                       else "/tools repo ПАПКА — выбрать подпапку своей рабочей директории."), [
             [("Выключить веб" if settings.web_enabled else "Включить веб",
@@ -1024,6 +1030,8 @@ class TelegramBot:
               "/tools code " + ("off" if settings.code_enabled else "on"))],
             [("Выключить PowerShell" if settings.powershell_enabled else "Включить PowerShell",
               "/tools powershell " + ("off" if settings.powershell_enabled else "on"))],
+            [("Выключить HTTP" if settings.http_enabled else "Включить HTTP",
+              "/tools http " + ("off" if settings.http_enabled else "on"))],
             [("Рабочая директория", "/tools repo ."), ("Отключить всё", "/tools off")],
         ])
 
@@ -1153,7 +1161,8 @@ class TelegramBot:
             config = copy.deepcopy(self.runtime.config)
             config["system_prompt"] = user.config["system_prompt"]
             harness = ToolHarness(user.settings, approve) if (user.settings.web_enabled or user.settings.code_enabled
-                                                             or user.settings.powershell_enabled) else None
+                                                             or user.settings.powershell_enabled
+                                                             or user.settings.http_enabled) else None
             if harness is not None:
                 user.settings = harness.settings
                 harness_status.configure(harness.settings)

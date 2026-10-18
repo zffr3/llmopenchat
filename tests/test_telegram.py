@@ -370,7 +370,8 @@ class TelegramBotTests(unittest.TestCase):
         save_session(user.sessions / "seed.json", seed, "test")
         for command in ("/clear", "/system Новая инструкция", "/load seed.json", "/history 1", "/quit", "/exit"):
             with self.subTest(command=command):
-                user.settings = HarnessSettings(web_enabled=True, repository=user.workspace, powershell_enabled=True)
+                user.settings = HarnessSettings(web_enabled=True, repository=user.workspace, powershell_enabled=True,
+                                                http_enabled=True)
                 self.bot.command(user, USER, command)
                 self.assertEqual(user.settings, HarnessSettings())
         self.bot.command(user, USER, "/load seed.json")
@@ -431,6 +432,29 @@ class TelegramBotTests(unittest.TestCase):
         self.assertFalse(user.settings.powershell_enabled)
         self.assertFalse(user.settings.code_enabled)
         self.bot.command(user, USER, "/tools powershell on")
+        self.bot.command(user, USER, "/tools off")
+        self.assertEqual(user.settings, HarnessSettings())
+
+    def test_http_menu_is_independent_and_needs_no_repository(self):
+        user = self.send("/start")
+        other = self.send("/start", OTHER)
+        self.bot.command(user, USER, "/tools")
+        menu = self.api.messages[-1]
+        button = next(button for row in menu["reply_markup"]["inline_keyboard"] for button in row
+                      if button["text"] == "Включить HTTP")
+        self.bot.handle_update(callback_update(button["callback_data"], menu["message_id"], OTHER))
+        self.assertEqual(user.settings, HarnessSettings())
+        self.bot.handle_update(callback_update(button["callback_data"], menu["message_id"]))
+        self.join_worker()
+        self.assertEqual(user.settings, HarnessSettings(http_enabled=True))
+        self.assertEqual(other.settings, HarnessSettings())
+        self.assertIn("HTTP: включён", self.api.messages[-1]["text"])
+        for value in ("", "yes", "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.bot.command(user, USER, "/tools http " + value)
+        self.bot.command(user, USER, "/tools http off")
+        self.assertEqual(user.settings, HarnessSettings())
+        self.bot.command(user, USER, "/tools http on")
         self.bot.command(user, USER, "/tools off")
         self.assertEqual(user.settings, HarnessSettings())
 
@@ -710,6 +734,41 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(json.loads(user.messages[-2]["content"])["stdout"], "hello\n")
         self.assertEqual(user.messages[-1]["content"], "Скрипт вывел hello.")
         self.assertFalse((user.workspace / "hello.ps1").exists(), "This test mocks script execution")
+
+    def test_http_only_generation_requires_approval_and_returns_response_to_model(self):
+        user = self.send("/start")
+        self.bot.command(user, USER, "/tools http on")
+        arguments = {"url": "https://example.com/", "method": "POST",
+                     "headers": {"Content-Type": "application/json", "X-Test": "full-approval-header"},
+                     "body": json.dumps({"message": "Привет " * 1800}, ensure_ascii=False)}
+        run = tool_call("call-http", "http_request", json.dumps(arguments))
+        client = StreamingClient(
+            [StreamEvent("finish", "tool_calls"), StreamEvent("tool_call", run), StreamEvent("done", {})],
+            [StreamEvent("content", "HTTP 201: создано."), StreamEvent("finish", "stop")],
+        )
+
+        with (patch.object(telegram, "ApiClient", return_value=client),
+              patch("llmopenchat.harness._request_http_public", return_value={"status_code": 201,
+                    "headers": {"content-type": "application/json"}, "body": '{"id":7}'}) as request):
+            self.bot.handle_update(message_update("Отправь запрос"))
+            message, data, _ = self.ready_approval()
+            self.assertIn("approval.txt", message["text"])
+            self.assertIn("full-approval-header", message["text"])
+            self.assertEqual(self.api.documents[-1][0:2], (USER, "approval.txt"))
+            uploaded = self.api.documents[-1][2].decode("utf-8")
+            self.assertIn(arguments["body"], uploaded)
+            self.assertIn(json.dumps(arguments["headers"], ensure_ascii=False), uploaded)
+            self.assertEqual(len(client.requests), 1)
+            request.assert_not_called()
+            self.bot.handle_update(callback_update(data, message["message_id"]))
+            self.join_worker()
+        request.assert_called_once_with(arguments["url"], arguments["method"], arguments["headers"], arguments["body"])
+        self.assertEqual([item["function"]["name"] for item in client.requests[0][1]], ["http_request"])
+        response = json.loads(client.requests[1][0][-1]["content"])
+        self.assertEqual(response["status_code"], 201)
+        self.assertEqual(response["body"], '{"id":7}')
+        self.assertIn("HTTP подключён", self.api.messages[-1]["text"])
+        self.assertEqual(load_session(user.directory / "current.json"), user.messages)
 
     def test_error_reply_retains_written_file_status_without_persisting_ui_state(self):
         user = self.send("/start")

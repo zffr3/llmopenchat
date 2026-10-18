@@ -156,8 +156,11 @@ class ScenarioTests(unittest.TestCase):
 
     def test_autoapproval_requires_explicit_matching_capability(self):
         invalid = [
-            {"web_enabled": "true"}, {"code_enabled": 1}, {"powershell_enabled": []},
+            {"web_enabled": "true"}, {"http_enabled": "true"}, {"code_enabled": 1}, {"powershell_enabled": []},
             {"auto_approve": True}, {"auto_approve": ["web_fetch"]},
+            {"auto_approve": ["http_request"]},
+            {"web_enabled": True, "auto_approve": ["http_request"]},
+            {"http_enabled": True, "auto_approve": ["web_fetch"]},
             {"web_enabled": True, "auto_approve": ["shell"]},
             {"web_enabled": True, "auto_approve": ["web_fetch", "web_fetch"]},
             {"web_enabled": True, "auto_approve": [42]},
@@ -175,6 +178,31 @@ class ScenarioTests(unittest.TestCase):
         self.assertTrue(scenario.harness_settings().powershell_enabled)
         with self.assertRaises(ScenarioError):
             self.load({**self.definition, "harness": {"powershell_enabled": True, "repository": "repo", "auto_approve": ["read_file"]}})
+
+    def test_http_is_independent_and_needs_explicit_autoapproval(self):
+        scenario = self.load({**self.definition, "harness": {"http_enabled": True}})
+        self.assertTrue(scenario.harness_settings().http_enabled)
+        self.assertFalse(scenario.harness_settings().web_enabled)
+        self.assertFalse(scenario.harness_settings().code_enabled)
+        self.assertFalse(scenario.harness_settings().powershell_enabled)
+        self.assertEqual(scenario.allowed_tools, frozenset())
+        self.assertFalse(scenario.approval(ToolRequest("http_request", {"url": "http://10.0.0.4/api"}, "http")))
+
+    def test_http_autoapproval_uses_exact_allowlisted_origin(self):
+        self.path.parent.joinpath("hosts.txt").write_text("https://api.example\n", encoding="utf-8")
+        scenario = self.load({**self.definition, "harness": {"http_enabled": True, "auto_approve": ["http_request"]}})
+        self.assertEqual(scenario.allowed_tools, frozenset({"http_request"}))
+        for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+            with self.subTest(method=method):
+                self.assertTrue(scenario.approval(ToolRequest("http_request", {
+                    "method": method, "url": "https://api.example/items?q=1", "body": "данные",
+                }, "http")))
+        for url in ("https://other.example/api", "http://api.example/api", "https://api.example:8443/api",
+                    "https://api.example@other.example/api", "https://api.example/api#fragment", None):
+            with self.subTest(url=url):
+                self.assertFalse(scenario.approval(ToolRequest("http_request", {"url": url}, "http")))
+        self.assertFalse(scenario.approval(ToolRequest("web_fetch", {"url": "https://api.example/api"}, "web")))
+        self.assertFalse(scenario.approval(ToolRequest("http_request", {}, "http")))
 
     def test_input_limit_is_bounded_integer(self):
         scenario = self.load({**self.definition, "input": {"max_bytes": MAX_INPUT_BYTES}})
@@ -225,7 +253,8 @@ class ScenarioTests(unittest.TestCase):
 
     def test_network_requires_sibling_hosts_and_post_origin_must_match(self):
         self.path.parent.joinpath("hosts.txt").unlink()
-        for params in ({"harness": {"web_enabled": True}}, {"output": {"type": "post", "url": "http://localhost/result"}}):
+        for params in ({"harness": {"web_enabled": True}}, {"harness": {"http_enabled": True}},
+                       {"output": {"type": "post", "url": "http://localhost/result"}}):
             with self.subTest(params=params), self.assertRaises(ScenarioError):
                 self.load({**self.definition, **params})
         self.path.parent.joinpath("hosts.txt").write_text("http://localhost:9000\n", encoding="utf-8")

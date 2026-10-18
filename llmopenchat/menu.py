@@ -41,11 +41,13 @@ def tools_menu(settings: HarnessSettings, root: Path, console: Console) -> Harne
             f"Веб: {'включён' if settings.web_enabled else 'выключен'}\n"
             f"Код: {'включён' if settings.code_enabled else 'выключен'}\n"
             f"PowerShell: {'включён' if settings.powershell_enabled else 'выключен'}\n"
+            f"HTTP: {'включён' if settings.http_enabled else 'выключен'}\n"
             f"Репозиторий: {settings.repository or 'не выбран'}\n"
-            "Каждое чтение, поиск, запись, запуск и веб-запрос требуют отдельного подтверждения.\n"
+            "Каждое чтение, поиск, запись, запуск и веб/HTTP-запрос требуют отдельного подтверждения.\n"
             "1 — Включить/выключить веб\n2 — Включить/выключить код\n"
             "3 — Выбрать репозиторий и включить код\n4 — Отключить всё\n"
-            "5 — Включить/выключить PowerShell (ограниченный сеанс)\n0 — Вернуться в чат")
+            "5 — Включить/выключить PowerShell (ограниченный сеанс)\n"
+            "6 — Включить/выключить HTTP-запросы\n0 — Вернуться в чат")
         choice = read_choice("Инструменты > ")
         if choice == "0":
             return settings
@@ -53,6 +55,12 @@ def tools_menu(settings: HarnessSettings, root: Path, console: Console) -> Harne
             if choice == "1":
                 settings = replace(settings, web_enabled=not settings.web_enabled)
                 say(console, "Веб включён." if settings.web_enabled else "Веб выключен.")
+            elif choice == "6":
+                settings = replace(settings, http_enabled=not settings.http_enabled)
+                say(console, "HTTP включён." if settings.http_enabled else "HTTP выключен.")
+                if settings.http_enabled:
+                    say(console, "HTTP(S) к публичным адресам на стандартных портах; "
+                        "метод, заголовки и тело показываются перед каждым запросом.")
             elif choice == "2" and settings.code_enabled:
                 settings = replace(settings, code_enabled=False)
                 say(console, "Код выключен.")
@@ -85,9 +93,9 @@ def tools_menu(settings: HarnessSettings, root: Path, console: Console) -> Harne
                     say(console, f"Код включён. Репозиторий: {settings.repository}")
             elif choice == "4":
                 settings = HarnessSettings()
-                say(console, "Веб, код и PowerShell выключены.")
+                say(console, "Веб, код, PowerShell и HTTP выключены.")
             else:
-                say(console, "Введите 1, 2, 3, 4, 5 или 0.")
+                say(console, "Введите 1, 2, 3, 4, 5, 6 или 0.")
         except (HarnessError, OSError, ValueError) as error:
             say(console, f"Ошибка подключения инструмента: {error}")
 

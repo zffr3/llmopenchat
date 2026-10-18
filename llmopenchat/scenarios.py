@@ -26,6 +26,7 @@ MAX_JSON_BYTES = 1024 * 1024
 MAX_INPUT_BYTES = 16 * MAX_JSON_BYTES
 _CODE_TOOLS = frozenset({"list_files", "read_file", "write_file", "search_files", "create_directory"})
 _WEB_TOOLS = frozenset({"web_fetch", "web_search"})
+_NETWORK_TOOLS = _WEB_TOOLS | {"http_request"}
 _REQUEST_FIELDS = frozenset({
     "model", "messages", "stream", "stream_options", "temperature", "max_tokens",
     "tools", "tool_choice", "parallel_tool_calls", "response_format",
@@ -233,6 +234,7 @@ class ScenarioHarness:
     powershell_enabled: bool = False
     repository: Path | None = None
     auto_approve: frozenset[str] = frozenset()
+    http_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -275,13 +277,14 @@ class Scenario:
         return HarnessSettings(
             web_enabled=self.harness.web_enabled, code_enabled=self.harness.code_enabled,
             powershell_enabled=self.harness.powershell_enabled, repository=self.harness.repository,
+            http_enabled=self.harness.http_enabled,
         )
 
     def approval(self, request: ToolRequest) -> bool:
         """Autoapproval is restricted to allowlisted network requests."""
         if request.name not in self.allowed_tools:
             return False
-        if request.name == "web_fetch":
+        if request.name in {"web_fetch", "http_request"}:
             return self.network_allowed(request.arguments.get("url"))
         if request.name == "web_search":
             return self.network_allowed("https://html.duckduckgo.com/")
@@ -325,9 +328,9 @@ class Scenario:
 
 
 def _load_harness(value: object, parent: Path) -> ScenarioHarness:
-    values = _object(value, "harness", {"web_enabled", "code_enabled", "powershell_enabled", "repository", "auto_approve"})
+    values = _object(value, "harness", {"web_enabled", "http_enabled", "code_enabled", "powershell_enabled", "repository", "auto_approve"})
     switches = {}
-    for key in ("web_enabled", "code_enabled", "powershell_enabled"):
+    for key in ("web_enabled", "http_enabled", "code_enabled", "powershell_enabled"):
         switch = values.get(key, False)
         if type(switch) is not bool:
             raise ScenarioError(f"harness.{key} должен быть логическим значением.")
@@ -348,11 +351,13 @@ def _load_harness(value: object, parent: Path) -> ScenarioHarness:
         enabled.update(_CODE_TOOLS)
     if switches["web_enabled"]:
         enabled.update(_WEB_TOOLS)
+    if switches["http_enabled"]:
+        enabled.add("http_request")
     if switches["powershell_enabled"]:
         enabled.add("powershell_run")
     if set(names) - enabled:
         raise ScenarioError("harness.auto_approve допускает только явно включённые существующие инструменты.")
-    if set(names) - _WEB_TOOLS:
+    if set(names) - _NETWORK_TOOLS:
         raise ScenarioError("Автоподтверждение разрешено только для сетевых инструментов, ограниченных hosts.txt.")
     return ScenarioHarness(**switches, repository=repository, auto_approve=frozenset(names))
 
@@ -430,7 +435,7 @@ def load_scenario(path: Path) -> Scenario:
     harness = _load_harness(values.get("harness", {}), path.parent)
     output = _load_output(values.get("output", {}))
     hosts_path = path.parent / "hosts.txt"
-    hosts = load_hosts(hosts_path) if harness.web_enabled or output.type == "post" or os.path.lexists(hosts_path) else None
+    hosts = load_hosts(hosts_path) if harness.web_enabled or harness.http_enabled or output.type == "post" or os.path.lexists(hosts_path) else None
     if output.type == "post" and not hosts.allows(output.url):
         raise ScenarioError("output.url отсутствует в hosts.txt этого сценария.")
     return Scenario(

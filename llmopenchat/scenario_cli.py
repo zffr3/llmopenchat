@@ -35,7 +35,7 @@ NEWS_SCENARIO = {
     },
     "generation": {"temperature": 0, "max_tokens": 512, "response_mode": "json_schema"},
     "harness": {
-        "web_enabled": False, "code_enabled": False, "powershell_enabled": False,
+        "web_enabled": False, "code_enabled": False, "powershell_enabled": False, "http_enabled": False,
         "auto_approve": [],
     },
     "input": {"max_bytes": 1048576},

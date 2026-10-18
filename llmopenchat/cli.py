@@ -146,7 +146,7 @@ HELP = """/help              команды
 /menu              главное меню (сохранить чат и освободить память своей модели)
 /models            загрузка и выбор моделей
 /history           история чатов
-/tools             меню веба, кода и PowerShell; каждый вызов требует подтверждения
+/tools             меню веба, кода, PowerShell и HTTP; каждый вызов требует подтверждения
 /rag               команды базы знаний: on/off, add ПУТЬ, list, search ЗАПРОС, remove ID, clear
 /status            состояние RAG, харнеса, репозиторий и результаты последних вызовов
 /quit              выйти и остановить запущенный этим клиентом сервер
@@ -169,7 +169,7 @@ def chat(config: dict, root: Path, resumed_messages: list[dict] | None = None,
     console.print("\nllmopenchat", style="bold cyan")
     say(f"Модель: {config['target_model']}\nAPI: {config['base_url']}")
     console.print("F1 — справка · F2 — главное меню · F3 или /tools — инструменты · Ctrl+Q — выход\n", style="dim")
-    say("Веб, код и PowerShell выключены. Подключение — в /tools; каждый вызов требует вашего подтверждения.")
+    say("Веб, код, PowerShell и HTTP выключены. Подключение — в /tools; каждый вызов требует вашего подтверждения.")
     state_dir = root / ".local"
     state_dir.mkdir(exist_ok=True)
     session_path = new_session_path(root)
@@ -314,7 +314,7 @@ def chat(config: dict, root: Path, resumed_messages: list[dict] | None = None,
                     say(f"Не удалось сохранить вызовы инструментов: {error}")
         try:
             options = {"rag": rag} if rag.enabled else {}
-            if settings.web_enabled or settings.code_enabled or settings.powershell_enabled:
+            if settings.web_enabled or settings.code_enabled or settings.powershell_enabled or settings.http_enabled:
                 def approve(request: ToolRequest) -> bool:
                     harness_status.phase = "approval"
                     harness_status.last_tool = request.name

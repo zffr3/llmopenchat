@@ -254,6 +254,48 @@ class ToolsCliTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["4", "0"]):
             self.assertEqual(menu.tools_menu(enabled, self.root, self.console), HarnessSettings())
 
+    def test_http_menu_toggle_needs_no_repository_and_reports_status(self):
+        with patch("builtins.input", side_effect=["6", "0"]):
+            enabled = menu.tools_menu(HarnessSettings(), self.root, self.console)
+        self.assertEqual(enabled, HarnessSettings(http_enabled=True))
+        self.assertEqual({item["function"]["name"] for item in ToolHarness(enabled, lambda request: False).schemas()},
+                         {"http_request"})
+        status = HarnessStatus()
+        status.configure(enabled)
+        self.assertTrue(status.enabled)
+        self.assertEqual(status.phase, "ready")
+        self.assertIn("HTTP подключён", status.compact())
+        self.assertIn("HTTP: включён", status.details())
+        with patch("builtins.input", side_effect=["6", "0"]):
+            self.assertEqual(menu.tools_menu(enabled, self.root, self.console), HarnessSettings())
+        with patch("builtins.input", side_effect=["4", "0"]):
+            self.assertEqual(menu.tools_menu(enabled, self.root, self.console), HarnessSettings())
+        status.configure(HarnessSettings())
+        self.assertFalse(status.enabled)
+        self.assertEqual(status.phase, "idle")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_http_only_chat_passes_tool_schema_and_requires_human_approval(self):
+        arguments = {"url": "https://example.com/", "method": "POST",
+                     "headers": {"Content-Type": "application/json"}, "body": '{"message":"Привет"}'}
+        client = Client(tool_round(call(name="http_request", arguments=json.dumps(arguments))),
+                        [StreamEvent("content", "Ответ получен."), StreamEvent("finish", "stop")])
+
+        with (patch.object(cli.sys.stdin, "isatty", return_value=False),
+              patch("builtins.input", side_effect=["/tools", "6", "0", "Отправь запрос", "разрешить", "/quit"]),
+              patch.object(cli, "ApiClient", return_value=client),
+              patch("llmopenchat.harness._request_http_public", return_value={"status_code": 200,
+                    "headers": {"content-type": "application/json"}, "body": "{}"}) as request):
+            self.assertEqual(cli.chat(copy.deepcopy(DEFAULT_CONFIG), self.root), 0)
+        request.assert_called_once_with(arguments["url"], arguments["method"], arguments["headers"], arguments["body"])
+        self.assertEqual([item["function"]["name"] for item in client.requests[0][1]], ["http_request"])
+        self.assertEqual(json.loads(client.requests[1][0][-1]["content"])["status_code"], 200)
+        self.assertIn("Вызов разрешён.", self.output.getvalue())
+        self.assertIn("Content-Type", self.output.getvalue())
+        self.assertIn("application/json", self.output.getvalue())
+        self.assertIn("Привет", self.output.getvalue())
+        self.assertIn("HTTP подключён", self.output.getvalue())
+
     def test_status_warns_about_unconfirmed_partial_mutation(self):
         status = HarnessStatus(HarnessSettings(web_enabled=True))
         status.update("harness_summary", {"requested": 1, "succeeded": 0, "denied": 0, "failed": 1,
@@ -263,6 +305,16 @@ class ToolsCliTests(unittest.TestCase):
         self.assertIn("ошибка / прервано", status.compact())
         self.assertIn("возможны частичные изменения", status.compact())
         self.assertIn("ошибок: 1", status.compact())
+
+    def test_http_status_warns_about_unconfirmed_remote_result(self):
+        status = HarnessStatus(HarnessSettings(http_enabled=True))
+        status.update("harness_summary", {"requested": 1, "succeeded": 0, "denied": 0, "failed": 1,
+                                         "uncertain_changes": False, "uncertain_http_requests": 1})
+        self.assertIn("HTTP-запрос мог быть выполнен; проверьте сервер", status.compact())
+        self.assertIn("HTTP-запрос мог быть выполнен; проверьте сервер", status.details())
+        self.assertNotIn("возможны частичные изменения", status.compact())
+        status.configure(HarnessSettings())
+        self.assertNotIn("HTTP-запрос мог быть выполнен", status.details())
 
     def test_disabled_and_incomplete_tools_cannot_execute(self):
         for events, enabled in ((tool_round(call()), False),
@@ -309,11 +361,12 @@ class ToolsCliTests(unittest.TestCase):
         seed = self.root / "seed.json"
         save_session(seed, [{"role": "user", "content": "old"}], "test")
         final = [StreamEvent("content", "/tools\n1\nразрешить"), StreamEvent("finish", "stop")]
-        for reset in ("/clear", "/system instruction", f'/load "{seed}"'):
-            client = Client(final, final)
-            self.run_chat(["/tools", "1", "0", "first", reset, "second", "/quit"], client)
-            self.assertIsNotNone(client.requests[0][1])
-            self.assertIsNone(client.requests[1][1])
+        for toggle in ("1", "6"):
+            for reset in ("/clear", "/system instruction", f'/load "{seed}"'):
+                client = Client(final, final)
+                self.run_chat(["/tools", toggle, "0", "first", reset, "second", "/quit"], client)
+                self.assertIsNotNone(client.requests[0][1])
+                self.assertIsNone(client.requests[1][1])
         client = Client(final)
         self.run_chat(["new chat", "/quit"], client)
         self.assertIsNone(client.requests[0][1])

@@ -17,7 +17,8 @@ class HarnessStatus:
 
     def configure(self, settings: HarnessSettings) -> None:
         if settings != self.settings:
-            self.phase = "ready" if settings.code_enabled or settings.web_enabled or settings.powershell_enabled else "idle"
+            self.phase = "ready" if (settings.code_enabled or settings.web_enabled
+                                     or settings.powershell_enabled or settings.http_enabled) else "idle"
             self.last_tool = self.last_result = ""
             self.summary = None
         self.settings = settings
@@ -41,7 +42,8 @@ class HarnessStatus:
 
     @property
     def enabled(self) -> bool:
-        return self.settings.code_enabled or self.settings.web_enabled or self.settings.powershell_enabled
+        return (self.settings.code_enabled or self.settings.web_enabled
+                or self.settings.powershell_enabled or self.settings.http_enabled)
 
     def connection(self) -> str:
         if not self.enabled:
@@ -53,6 +55,8 @@ class HarnessStatus:
             names.append("веб")
         if self.settings.powershell_enabled:
             names.append("PowerShell")
+        if self.settings.http_enabled:
+            names.append("HTTP")
         return "Харнес: " + "+".join(names) + " подключён"
 
     def activity(self) -> str:
@@ -73,13 +77,17 @@ class HarnessStatus:
         if self.summary is not None:
             count = self.summary.get("requested", 0)
             prefix = "ошибка / прервано · " if self.phase == "error" else ""
+            http_warning = (" · HTTP-запрос мог быть выполнен; проверьте сервер"
+                            if self.summary.get("uncertain_http_requests", 0) > 0 else "")
             if not count:
-                return prefix + "модель не вызвала инструменты; изменений на диске нет"
+                return prefix + "модель не вызвала инструменты; изменений на диске нет" + http_warning
             counts = (f"вызовов: {count} · успешно: {self.summary.get('succeeded', 0)}"
                     f" · отказов: {self.summary.get('denied', 0)} · ошибок: {self.summary.get('failed', 0)}"
                     f" · файлов записано: {len(self.summary.get('files_written', []))}"
                     f" · успешно выполнено скриптов: {len(self.summary.get('scripts_run', []))}")
-            return prefix + counts + (" · возможны частичные изменения" if self.summary.get("uncertain_changes") else "")
+            return (prefix + counts
+                    + (" · возможны частичные изменения" if self.summary.get("uncertain_changes") else "")
+                    + http_warning)
         if self.last_result:
             result = {"ok": "успешно", "denied": "отклонён", "error": "ошибка"}.get(self.last_result, "ошибка")
             return f"{self.last_tool}: {result}"
@@ -98,6 +106,7 @@ class HarnessStatus:
         lines.append("Веб: " + ("включён" if self.settings.web_enabled else "выключен"))
         lines.append("Код: " + ("включён" if self.settings.code_enabled else "выключен"))
         lines.append("PowerShell: " + ("включён" if self.settings.powershell_enabled else "выключен"))
+        lines.append("HTTP: " + ("включён" if self.settings.http_enabled else "выключен"))
         if self.settings.code_enabled or self.settings.powershell_enabled:
             lines.append(f"Граница файлового доступа: {self.settings.repository}")
         if self.enabled:

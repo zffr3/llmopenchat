@@ -121,7 +121,7 @@ class SharedTelegramTests(unittest.TestCase):
     def test_client_commands_and_direct_command_calls_cannot_change_shared_configuration(self):
         user = self.send("/start")
         before = copy.deepcopy(user.config), copy.deepcopy(user.messages), user.settings
-        commands = ("/tools web on", "/tools repo .", "/rag on", "/system forbidden",
+        commands = ("/tools web on", "/tools http on", "/tools repo .", "/rag on", "/system forbidden",
                     "/clear", "/thinking", "/save stolen.json", "/load unknown.json",
                     "/history", "/models", "/cancel", "/quit", "/exit")
         with (patch.object(self.bot, "tools") as tools,
@@ -189,7 +189,7 @@ class SharedTelegramTests(unittest.TestCase):
     @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_admin_repository_tools_and_rag_survive_clear_and_restart(self):
         user = self.send("/start", USER)
-        for command in ("/tools web on", "/tools code on", "/rag on"):
+        for command in ("/tools web on", "/tools code on", "/tools http on", "/rag on"):
             self.send(command, USER)
         original = user.settings
         self.send("/clear", USER)
@@ -201,8 +201,32 @@ class SharedTelegramTests(unittest.TestCase):
         restored = restarted.user_chat(OTHER)
         self.assertTrue(restored.settings.web_enabled)
         self.assertTrue(restored.settings.code_enabled)
+        self.assertTrue(restored.settings.http_enabled)
         self.assertEqual(restored.settings.repository, self.repository)
         self.assertTrue(restored.rag.enabled)
+
+    def test_shared_http_only_setting_survives_restart_and_validates_saved_type(self):
+        user = self.send("/tools http on", USER)
+        self.assertTrue(user.settings.http_enabled)
+        self.assertFalse(user.settings.web_enabled)
+        self.assertFalse(user.settings.code_enabled)
+        self.assertFalse(user.settings.powershell_enabled)
+        path = user.directory / "settings.json"
+        values = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIs(values["http_enabled"], True)
+        self.bot.close()
+        restarted = self.make_bot(FakeAPI())
+        restored = restarted.user_chat(USER)
+        self.assertTrue(restored.settings.http_enabled)
+        restarted.command(restored, USER, "/tools off")
+        self.assertFalse(json.loads(path.read_text(encoding="utf-8"))["http_enabled"])
+        self.assertEqual(restored.settings.repository, self.repository)
+        restarted.close()
+        values["http_enabled"] = "true"
+        path.write_text(json.dumps(values), encoding="utf-8")
+        invalid = self.make_bot(FakeAPI())
+        with self.assertRaisesRegex(ValueError, "переключатель"):
+            invalid.user_chat(USER)
 
     @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_admin_can_choose_root_relative_or_absolute_existing_repository(self):

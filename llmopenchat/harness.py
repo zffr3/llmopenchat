@@ -1,4 +1,4 @@
-"""Opt-in, human-approved tools for one chat's repository and public web.
+"""Opt-in, human-approved tools for one chat's repository and public HTTP.
 
 Settings are owned by the CLI, never exposed as a model tool. Every invocation
 gets a fresh approval, including listing, searching, and reading. Code tools use
@@ -38,6 +38,10 @@ MAX_DEPTH = 24
 MAX_SEARCH_BYTES = 4 * 1024 * 1024
 MAX_WEB_BYTES = 512 * 1024
 MAX_WEB_TEXT = 24000
+MAX_HTTP_BODY_BYTES = 256 * 1024
+MAX_HTTP_HEADERS = 32
+MAX_HTTP_HEADER_BYTES = 16 * 1024
+HTTP_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 NETWORK_TIMEOUT = 15.0
 
 
@@ -51,6 +55,12 @@ class _PowerShellFailure(HarnessError):
         self.execution_started = execution_started
 
 
+class _HttpFailure(HarnessError):
+    def __init__(self, message: str, *, request_started: bool):
+        super().__init__(message)
+        self.request_started = request_started
+
+
 @dataclass(frozen=True)
 class HarnessSettings:
     web_enabled: bool = False
@@ -60,6 +70,7 @@ class HarnessSettings:
     # It is never exposed in tool schemas or accepted from model arguments.
     repository_identity: tuple[int, int, int] | None = None
     powershell_enabled: bool = False
+    http_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -167,10 +178,49 @@ _SCHEMAS = {
     "web_search": _function("web_search", "Search the public web using a DuckDuckGo HTML GET and return bounded text and links.", {
         "query": {"type": "string", "minLength": 1, "maxLength": 500},
     }, ["query"]),
+    "http_request": _function("http_request", "Send one public HTTP(S) request without redirects or retries. Returns status_code, headers and a text body (up to 24000 characters, truncated flag). HTTP errors such as 404 are returned as responses. No private networks or inherited credentials. An error after request_started=true may have changed remote state; do not automatically repeat it.", {
+        "url": {"type": "string", "description": "Public HTTP(S) URL on its standard port."},
+        "method": {"type": "string", "enum": list(HTTP_METHODS), "default": "GET"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}, "maxProperties": MAX_HTTP_HEADERS,
+                    "description": "Explicit headers, including Authorization if needed. No Host, framing, proxy or connection headers; at most 16 KiB total.", "default": {}},
+        "body": {"type": "string", "description": "Exact UTF-8 request body, up to 256 KiB. For JSON, serialize it here and set Content-Type to application/json. GET/HEAD bodies are forbidden.", "default": ""},
+    }, ["url"]),
 }
 _CODE_TOOLS = frozenset({"list_files", "read_file", "write_file", "search_files", "create_directory"})
 _REPOSITORY_TOOLS = _CODE_TOOLS | {"powershell_run"}
 _WEB_TOOLS = frozenset({"web_fetch", "web_search"})
+_FORBIDDEN_HTTP_HEADERS = frozenset({
+    "host", "content-length", "transfer-encoding", "connection", "proxy-connection",
+    "proxy-authorization", "proxy-authenticate", "upgrade", "expect", "te", "trailer", "accept-encoding",
+})
+
+
+def _http_arguments(arguments: dict) -> None:
+    """Validate explicitly supplied headers before approval or any DNS lookup."""
+    headers = arguments["headers"]
+    if len(headers) > MAX_HTTP_HEADERS:
+        raise HarnessError(f"Число HTTP-заголовков ограничено {MAX_HTTP_HEADERS}.")
+    seen = set()
+    total = 0
+    for name, value in headers.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise HarnessError("Недопустимое имя HTTP-заголовка.")
+        lower = name.lower()
+        if lower in seen or lower in _FORBIDDEN_HTTP_HEADERS or lower.startswith("proxy-"):
+            raise HarnessError("Повторяющийся или служебный HTTP-заголовок запрещён: " + name)
+        seen.add(lower)
+        if not isinstance(value, str) or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value) or _BIDI.search(value):
+            raise HarnessError("HTTP-заголовки должны содержать строки без управляющих символов.")
+        try:
+            total += len(name) + len(value.encode("latin-1")) + 4
+        except UnicodeError as error:
+            raise HarnessError("Значения HTTP-заголовков должны поддерживать кодировку Latin-1.") from error
+    if total > MAX_HTTP_HEADER_BYTES:
+        raise HarnessError(f"HTTP-заголовки превышают лимит {MAX_HTTP_HEADER_BYTES} байт.")
+    if len(arguments["body"].encode("utf-8")) > MAX_HTTP_BODY_BYTES:
+        raise HarnessError(f"Тело HTTP-запроса превышает лимит {MAX_HTTP_BODY_BYTES} байт.")
+    if arguments["method"] in {"GET", "HEAD"} and arguments["body"]:
+        raise HarnessError("Тело запроса GET/HEAD запрещено; используйте параметры URL или другой метод.")
 
 
 def _run_restricted_powershell(source: str, repository: Path, timeout_seconds: int) -> dict:
@@ -264,7 +314,8 @@ def _resolve_public(host: str, port: int, deadline: float) -> list[tuple]:
     return entries
 
 
-def _request_public(url: str) -> tuple[bytes, str]:
+def _exchange_public(url: str, *, method: str = "GET", headers: dict | None = None,
+                     body: bytes | None = None, web: bool = True) -> tuple[bytes, str] | dict:
     parsed = urlsplit(url)
     host = parsed.hostname
     port = 443 if parsed.scheme == "https" else 80
@@ -291,6 +342,7 @@ def _request_public(url: str) -> tuple[bytes, str]:
     timer = threading.Timer(max(0.001, deadline - time.monotonic()), interrupt)
     timer.daemon = True
     timer.start()
+    request_started = False
     try:
         with socket_lock:
             if cancelled.is_set() or time.monotonic() >= deadline:
@@ -314,14 +366,28 @@ def _request_public(url: str) -> tuple[bytes, str]:
         target = parsed.path or "/"
         if parsed.query:
             target += "?" + parsed.query
-        connection.request("GET", target, headers={
+        request_headers = {
             "User-Agent": "llmopenchat/0.1 human-approved-public-web",
             "Accept": "text/html,text/plain,application/json,application/xml;q=0.8",
+        }
+        if headers is not None:
+            # Override defaults case-insensitively. Transport headers remain
+            # host-owned; callers cannot alter framing, routing or compression.
+            defaults = {name.lower(): name for name in request_headers}
+            for name, value in headers.items():
+                request_headers.pop(defaults.get(name.lower(), name), None)
+                request_headers[name] = value
+        request_headers.update({
             "Accept-Encoding": "identity",
             "Connection": "close",
         })
+        request_started = True
+        if web:
+            connection.request(method, target, headers=request_headers)
+        else:
+            connection.request(method, target, body=body, headers=request_headers)
         response = connection.getresponse()
-        if 300 <= response.status < 400:
+        if web and 300 <= response.status < 400:
             location = response.getheader("Location")
             message = "Сервер вернул перенаправление. Автоматический переход запрещён; для нового URL нужен отдельный вызов и апрув."
             if location:
@@ -330,27 +396,73 @@ def _request_public(url: str) -> tuple[bytes, str]:
                 except (HarnessError, ValueError):
                     message += " Адрес перенаправления небезопасен или некорректен."
             raise HarnessError(message)
-        if not 200 <= response.status < 300:
+        if web and not 200 <= response.status < 300:
             raise HarnessError(f"Сервер вернул HTTP {response.status}.")
-        if response.getheader("Content-Encoding", "identity").lower() not in {"", "identity"}:
+        response_headers = {}
+        if not web:
+            header_items = response.getheaders()
+            if sum(len(name) + len(value) + 4 for name, value in header_items) > MAX_HTTP_HEADER_BYTES:
+                raise HarnessError(f"HTTP-заголовки ответа превышают лимит {MAX_HTTP_HEADER_BYTES} байт.")
+            for name, value in header_items:
+                lower = name.lower()
+                response_headers[lower] = response_headers[lower] + ", " + value if lower in response_headers else value
+        no_body = not web and (method == "HEAD" or response.status in {204, 304} or response.status < 200)
+        if not no_body and response.getheader("Content-Encoding", "identity").lower() not in {"", "identity"}:
             raise HarnessError("Сжатые сетевые ответы запрещены.")
         content_type = response.getheader("Content-Type", "text/plain")
         mime = content_type.split(";", 1)[0].strip().lower()
-        if not (mime.startswith("text/") or mime in {"application/json", "application/xml", "application/xhtml+xml", "application/javascript"}):
+        text_mime = mime.startswith("text/") or mime in {"application/json", "application/xml", "application/xhtml+xml", "application/javascript"}
+        if not web:
+            text_mime = text_mime or mime.endswith(("+json", "+xml")) or mime in {"application/x-ndjson", "application/x-www-form-urlencoded"}
+        if not no_body and not text_mime:
             raise HarnessError("Разрешены только текстовые веб-ответы.")
         length = response.getheader("Content-Length")
-        if length is not None and (not length.isdecimal() or int(length) > MAX_WEB_BYTES):
+        if not no_body and length is not None and (not length.isdecimal() or int(length) > MAX_WEB_BYTES):
             raise HarnessError(f"Веб-ответ превышает лимит {MAX_WEB_BYTES} байт.")
-        content = response.read(MAX_WEB_BYTES + 1)
+        content = b"" if no_body else response.read(MAX_WEB_BYTES + 1)
         if len(content) > MAX_WEB_BYTES:
             raise HarnessError(f"Веб-ответ превышает лимит {MAX_WEB_BYTES} байт.")
+        if not web and not no_body and length is not None and len(content) != int(length):
+            raise HarnessError("HTTP-ответ оборвался до получения полного тела Content-Length.")
         if time.monotonic() >= deadline:
             raise HarnessError("Истекло время веб-запроса.")
-        return content, content_type
+        if web:
+            return content, content_type
+        charset = re.search(r"charset\s*=\s*[\"']?([\w-]+)", content_type, re.I)
+        encoding = charset.group(1) if charset else "utf-8"
+        try:
+            text = content.decode(encoding, errors="replace")
+        except LookupError:
+            text = content.decode("utf-8", errors="replace")
+        return {"url": url, "method": method, "status_code": response.status,
+                "headers": response_headers, "body": text[:MAX_WEB_TEXT],
+                "truncated": len(text) > MAX_WEB_TEXT, "bytes_received": len(content), "request_started": True}
+    except (HarnessError, OSError, UnicodeError, HTTPException, ValueError, TypeError, OverflowError) as error:
+        if not web:
+            raise _HttpFailure(str(error), request_started=request_started) from error
+        raise
     finally:
         timer.cancel()
         connection.close()
         interrupt()
+
+
+def _request_public(url: str) -> tuple[bytes, str]:
+    return _exchange_public(url)
+
+
+def _request_http_public(url: str, method: str, headers: dict, body: str) -> dict:
+    values = {"method": method, "headers": headers, "body": body}
+    # Keep the network entry point safe even when called outside the tool loop.
+    if method not in HTTP_METHODS:
+        raise HarnessError("Недопустимый HTTP-метод.")
+    _http_arguments(values)
+    url = _url(url)
+    outgoing = dict(headers)
+    if body and not any(name.lower() == "content-type" for name in outgoing):
+        outgoing["Content-Type"] = "text/plain; charset=utf-8"
+    return _exchange_public(url, method=method, headers=outgoing,
+                            body=body.encode("utf-8") if body else None, web=False)
 
 
 class _ReadableHTML(HTMLParser):
@@ -416,7 +528,7 @@ def _web_text(url: str) -> dict:
 class ToolHarness:
     def __init__(self, settings: HarnessSettings, approve: Callable[[ToolRequest], bool],
                  *, protected_names: frozenset[str] = frozenset()):
-        if any(type(value) is not bool for value in (settings.web_enabled, settings.code_enabled, settings.powershell_enabled)):
+        if any(type(value) is not bool for value in (settings.web_enabled, settings.code_enabled, settings.powershell_enabled, settings.http_enabled)):
             raise HarnessError("Переключатели инструментов должны быть логическими значениями.")
         if not callable(approve):
             raise HarnessError("Для инструментов требуется обработчик ручного подтверждения.")
@@ -445,6 +557,8 @@ class ToolHarness:
             names.append("powershell_run")
         if self.settings.web_enabled:
             names.extend(("web_fetch", "web_search"))
+        if self.settings.http_enabled:
+            names.append("http_request")
         return [copy.deepcopy(_SCHEMAS[name]) for name in names]
 
     def _arguments(self, name: str, raw: str) -> dict:
@@ -456,6 +570,8 @@ class ToolHarness:
             raise HarnessError("PowerShell отключён для этого чата.")
         if name in _WEB_TOOLS and not self.settings.web_enabled:
             raise HarnessError("Веб-доступ отключён для этого чата.")
+        if name == "http_request" and not self.settings.http_enabled:
+            raise HarnessError("HTTP-запросы отключены для этого чата.")
         if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_ARGUMENT_BYTES:
             raise HarnessError("Аргументы должны быть JSON-объектом ограниченного размера.")
 
@@ -477,15 +593,17 @@ class ToolHarness:
         for key, definition in schema["properties"].items():
             if key not in arguments:
                 if "default" in definition:
-                    arguments[key] = definition["default"]
+                    arguments[key] = copy.deepcopy(definition["default"])
                 continue
             value = arguments[key]
-            expected = {"string": str, "boolean": bool, "integer": int}[definition["type"]]
+            expected = {"string": str, "boolean": bool, "integer": int, "object": dict}[definition["type"]]
             if type(value) is not expected:
                 raise HarnessError(f"Недопустимый тип аргумента {key}.")
             if isinstance(value, str) and (len(value) < definition.get("minLength", 0) or len(value) > definition.get("maxLength", MAX_ARGUMENT_BYTES)):
                 raise HarnessError(f"Недопустимая длина аргумента {key}.")
             if expected is int and not definition["minimum"] <= value <= definition["maximum"]:
+                raise HarnessError(f"Недопустимое значение аргумента {key}.")
+            if "enum" in definition and value not in definition["enum"]:
                 raise HarnessError(f"Недопустимое значение аргумента {key}.")
         if name in _REPOSITORY_TOOLS:
             parts = _relative(arguments["path"], directory=name in {"list_files", "search_files", "create_directory"})
@@ -493,11 +611,21 @@ class ToolHarness:
                 raise HarnessError("PowerShell запускает только существующие файлы .ps1 внутри выбранного репозитория.")
         if name == "write_file" and len(arguments["content"].encode("utf-8")) > MAX_FILE_BYTES:
             raise HarnessError(f"Содержимое превышает лимит {MAX_FILE_BYTES} байт.")
-        if name == "web_fetch":
+        if name in {"web_fetch", "http_request"}:
             arguments["url"] = _url(arguments["url"])
+        if name == "http_request":
+            _http_arguments(arguments)
         return arguments
 
     def _request(self, name: str, arguments: dict, directories_to_create: tuple[str, ...] = (), *, script_bytes: int | None = None) -> ToolRequest:
+        if name == "http_request":
+            body = arguments["body"]
+            summary = (f"Публичный HTTP {arguments['method']}: {arguments['url']}"
+                       f"\nОдин запрос, без перенаправлений и повторов. Лимит ответа: {MAX_WEB_BYTES} байт."
+                       "\nЗапрос может изменять данные на сервере."
+                       "\nЗаголовки: " + json.dumps(arguments["headers"], ensure_ascii=False)
+                       + f"\nПолное тело UTF-8: {len(body.encode('utf-8'))} байт.")
+            return ToolRequest(name, copy.deepcopy(arguments), summary, body)
         if name in _WEB_TOOLS:
             url = arguments["url"] if name == "web_fetch" else "https://html.duckduckgo.com/html/?" + urlencode({"q": arguments["query"]})
             summary = f"Публичный HTTP GET: {url} (один запрос, без перенаправлений, лимит {MAX_WEB_BYTES} байт)."
@@ -613,12 +741,18 @@ class ToolHarness:
                         result["message"] = "Ограниченный PowerShell завершился с ошибкой."
                 elif name in {"list_files", "search_files"}:
                     result = self._scan(locked, values, search=name == "search_files")
+                elif name == "http_request":
+                    result = _request_http_public(values["url"], values["method"], values["headers"], values["body"])
                 else:
                     url = values["url"] if name == "web_fetch" else "https://html.duckduckgo.com/html/?" + urlencode({"q": values["query"]})
                     result = _web_text(url)
                 return json.dumps({**result, "status": status}, ensure_ascii=False)
         except (HarnessError, FileAccessError, OSError, UnicodeError, HTTPException, ValueError, TypeError, OverflowError) as error:
             result = {"status": "error", "message": str(error)}
+            if name == "http_request":
+                result["request_started"] = getattr(error, "request_started", False) is True
+                if result["request_started"]:
+                    result["message"] += " HTTP-запрос мог быть выполнен сервером. Не повторяйте его автоматически."
             if name == "powershell_run":
                 result.update({"restricted": True, "available_cmdlets": list(_POWERSHELL_CMDLETS),
                                "execution_started": getattr(error, "execution_started", False) is True})
