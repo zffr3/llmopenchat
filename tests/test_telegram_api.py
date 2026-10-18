@@ -102,6 +102,16 @@ class TelegramAPITests(unittest.TestCase):
         self.assertEqual(self.api.get_me(), {"id": 123})
         self.assertEqual(self.opener.open.call_args.args[0].full_url.rsplit("/", 1)[1], "getMe")
 
+    def test_commands_can_target_a_specific_chat_scope(self):
+        commands = [{"command": "tools", "description": "Подключить харнесы"}]
+        scope = {"type": "chat", "chat_id": 101}
+        self.opener.open.return_value = response(True)
+
+        self.assertTrue(self.api.set_commands(commands, scope=scope))
+
+        self.assertEqual(self.payload(), {"commands": commands, "scope": scope})
+        self.assertEqual(self.opener.open.call_args.args[0].full_url.rsplit("/", 1)[1], "setMyCommands")
+
     def test_network_failure_suppresses_secret_and_chained_exception(self):
         self.opener.open.side_effect = URLError(f"https://api.telegram.org/bot{TOKEN}/getMe")
         with self.assertRaises(TelegramError) as raised:

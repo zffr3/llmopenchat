@@ -23,6 +23,7 @@ class ConfigTests(unittest.TestCase):
         loaded = load_config(self.path)
         loaded["server"]["threads"] = 1
         loaded["request_extra"]["chat_template_kwargs"]["enable_thinking"] = True
+        loaded["telegram"]["admin_user_id"] = 123456789
         self.assertEqual(load_config(self.path), DEFAULT_CONFIG)
 
     def test_partial_server_settings_keep_other_defaults(self):
@@ -39,6 +40,42 @@ class ConfigTests(unittest.TestCase):
     def test_request_extra_is_replaced_whole(self):
         self.write_json({"request_extra": {"top_p": 0.8}})
         self.assertEqual(load_config(self.path)["request_extra"], {"top_p": 0.8})
+
+    def test_telegram_legacy_defaults_and_partial_admin_settings(self):
+        self.assertEqual(load_config(self.path)["telegram"], {
+            "admin_user_id": None, "repository": None,
+        })
+        self.write_json({"telegram": {"admin_user_id": 123456789}})
+        self.assertEqual(load_config(self.path)["telegram"], {
+            "admin_user_id": 123456789, "repository": None,
+        })
+
+    def test_telegram_repository_preserves_absolute_or_relative_path(self):
+        for repository in ("projects/shared", str(self.path.parent / "репозиторий")):
+            with self.subTest(repository=repository):
+                self.write_json({"telegram": {
+                    "admin_user_id": 123456789, "repository": repository,
+                }})
+                self.assertEqual(load_config(self.path)["telegram"]["repository"], repository)
+
+    def test_invalid_telegram_roles_and_repository_settings(self):
+        invalid = [
+            None, [], "admin", 123,
+            {"admin_user_id": True}, {"admin_user_id": False},
+            {"admin_user_id": 0}, {"admin_user_id": -1},
+            {"admin_user_id": 1.5}, {"admin_user_id": "123456789"},
+            {"repository": "projects/shared"},
+            {"admin_user_id": 123456789, "repository": ""},
+            {"admin_user_id": 123456789, "repository": "   "},
+            {"admin_user_id": 123456789, "repository": "repo\x00hidden"},
+            {"admin_user_id": 123456789, "repository": True},
+            {"admin_user_id": 123456789, "repository": []},
+        ]
+        for telegram in invalid:
+            with self.subTest(telegram=telegram):
+                self.write_json({"telegram": telegram})
+                with self.assertRaisesRegex(ConfigError, "telegram"):
+                    load_config(self.path)
 
     def test_invalid_json_and_non_object_are_config_errors(self):
         for source in ("{broken", "[]", "null", '"value"'):

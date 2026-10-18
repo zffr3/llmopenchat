@@ -903,6 +903,144 @@ class TelegramStartupTests(unittest.TestCase):
         bot.close.assert_called_once()
         self.assertNotIn(self.token, "\n".join(self.emitted))
 
+    def test_shared_startup_registers_role_commands_and_preloads_before_server_start(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        runtime = Mock()
+        api = Mock()
+        api.get_me.return_value = {"username": "test_bot"}
+        bot = Mock()
+        events = []
+        bot.user_chat.side_effect = lambda user_id: events.append(("preload", user_id))
+        runtime.start.side_effect = lambda: events.append(("start",))
+        bot.poll.side_effect = lambda: events.append(("poll",))
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI", return_value=api),
+              patch.object(telegram, "TelegramBot", return_value=bot)):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 0)
+        self.assertEqual([(call.args, call.kwargs) for call in api.set_commands.call_args_list], [
+            ((telegram.CLIENT_COMMANDS,), {}),
+            ((telegram.COMMANDS,), {"scope": {"type": "chat", "chat_id": USER}}),
+        ])
+        self.assertEqual(events, [("preload", USER), ("start",), ("poll",)])
+        self.assertIs(bot.admin_commands_pending, False)
+        bot.close.assert_called_once()
+        runtime.shutdown.assert_called_once()
+
+    def test_shared_startup_defers_admin_menu_when_admin_has_not_opened_bot_chat(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        runtime = Mock()
+        api = Mock()
+        api.get_me.return_value = {"username": "test_bot"}
+        api.set_commands.side_effect = [None, TelegramError("Bad Request: chat not found", error_code=400)]
+        bot = Mock()
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI", return_value=api),
+              patch.object(telegram, "TelegramBot", return_value=bot)):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 0)
+        self.assertEqual([(call.args, call.kwargs) for call in api.set_commands.call_args_list], [
+            ((telegram.CLIENT_COMMANDS,), {}),
+            ((telegram.COMMANDS,), {"scope": {"type": "chat", "chat_id": USER}}),
+        ])
+        self.assertIs(bot.admin_commands_pending, True)
+        bot.user_chat.assert_called_once_with(USER)
+        runtime.start.assert_called_once()
+        bot.poll.assert_called_once()
+        bot.close.assert_called_once()
+        runtime.shutdown.assert_called_once()
+        self.assertIn("/start", "\n".join(self.emitted))
+
+    def test_shared_startup_rejects_other_admin_menu_registration_errors(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        runtime = Mock()
+        api = Mock()
+        api.get_me.return_value = {"username": "test_bot"}
+        api.set_commands.side_effect = [None, TelegramError("Bad Request: scope is invalid", error_code=400)]
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI", return_value=api),
+              patch.object(telegram, "TelegramBot") as bot_type):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 1)
+        runtime.start.assert_not_called()
+        runtime.shutdown.assert_called_once()
+        bot_type.assert_not_called()
+        self.assertIn("scope is invalid", "\n".join(self.emitted))
+
+    def test_only_admin_start_retries_pending_admin_menu_registration(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        self.config["backend"] = "external"
+        api = FakeAPI()
+        api.set_commands = Mock()
+        bot = telegram.TelegramBot(api, self.config, self.root, self.root / "whitelist.txt",
+                                   emit=self.emitted.append)
+        self.addCleanup(bot.close)
+        bot.admin_commands_pending = True
+        bot.handle_update(message_update("/start", OTHER))
+        api.set_commands.assert_not_called()
+        self.assertIs(bot.admin_commands_pending, True)
+        bot.handle_update(message_update("/start", USER))
+        api.set_commands.assert_called_once_with(telegram.COMMANDS, scope={"type": "chat", "chat_id": USER})
+        self.assertIs(bot.admin_commands_pending, False)
+        bot.handle_update(message_update("/start", USER))
+        self.assertEqual(api.set_commands.call_count, 1)
+
+    def test_shared_repository_preload_failure_is_reported_and_cleans_up_before_server_start(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        runtime = Mock()
+        api = Mock()
+        api.get_me.return_value = {"username": "test_bot"}
+        bot = Mock()
+        bot.user_chat.side_effect = telegram.HarnessError("Общий репозиторий недоступен.")
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI", return_value=api),
+              patch.object(telegram, "TelegramBot", return_value=bot)):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 1)
+        bot.user_chat.assert_called_once_with(USER)
+        runtime.start.assert_not_called()
+        bot.poll.assert_not_called()
+        bot.close.assert_called_once()
+        runtime.shutdown.assert_called_once()
+        output = "\n".join(self.emitted)
+        self.assertIn("Ошибка Telegram-бота: Общий репозиторий недоступен.", output)
+        self.assertNotIn(self.token, output)
+
+    def test_shared_startup_accepts_missing_client_whitelist(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        (self.root / "whitelist.txt").unlink()
+        runtime = Mock()
+        api = Mock()
+        api.get_me.return_value = {"username": "test_bot"}
+        bot = Mock()
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI", return_value=api),
+              patch.object(telegram, "TelegramBot", return_value=bot)):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 0)
+        bot.user_chat.assert_called_once_with(USER)
+        runtime.start.assert_called_once()
+        bot.poll.assert_called_once()
+        bot.close.assert_called_once()
+        runtime.shutdown.assert_called_once()
+        self.assertIn("Разрешено пользователей: 0", "\n".join(self.emitted))
+
+    def test_shared_startup_rejects_malformed_existing_client_whitelist(self):
+        self.config["telegram"]["admin_user_id"] = USER
+        (self.root / "whitelist.txt").write_text("@@unknown", encoding="utf-8")
+        runtime = Mock()
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI") as api_type):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 1)
+        api_type.assert_not_called()
+        runtime.start.assert_not_called()
+        runtime.shutdown.assert_called_once()
+
+    def test_legacy_startup_requires_client_whitelist_file(self):
+        (self.root / "whitelist.txt").unlink()
+        runtime = Mock()
+        with (patch.object(telegram, "BotRuntime", return_value=runtime),
+              patch.object(telegram, "TelegramAPI") as api_type):
+            self.assertEqual(telegram.run_telegram(self.config, self.root, emit=self.emitted.append), 1)
+        api_type.assert_not_called()
+        runtime.start.assert_not_called()
+        runtime.shutdown.assert_called_once()
+
     def test_missing_or_invalid_credentials_and_whitelist_fail_before_api_or_server_start(self):
         cases = [("credits.txt", None), ("credits.txt", "bad token"), ("whitelist.txt", "@@unknown")]
         for filename, content in cases:

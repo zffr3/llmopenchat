@@ -42,6 +42,10 @@ DEFAULT_CONFIG = {
         "top_k": 4,
         "max_context_chars": 5000,
     },
+    "telegram": {
+        "admin_user_id": None,
+        "repository": None,
+    },
     "server": {
         "executable": _default_executable(),
         "model_path": "models/huihui_ai--glm-4.7-flash-abliterated/Huihui-GLM-4.7-Flash-abliterated-ollama.Q4_K_M.llamacpp.gguf",
@@ -120,6 +124,18 @@ def validate_config(config: dict) -> None:
             raise ConfigError(f"rag.{key} должен быть целым числом от {minimum} до {maximum}.")
     if rag.get("chunk_overlap", 150) >= rag.get("chunk_size", 1000):
         raise ConfigError("rag.chunk_overlap должен быть меньше rag.chunk_size.")
+    telegram = config.get("telegram", DEFAULT_CONFIG["telegram"])
+    if not isinstance(telegram, dict):
+        raise ConfigError("telegram должен быть JSON-объектом.")
+    admin_user_id = telegram.get("admin_user_id")
+    if admin_user_id is not None and (type(admin_user_id) is not int or admin_user_id <= 0):
+        raise ConfigError("telegram.admin_user_id должен быть положительным целым Telegram user ID или null.")
+    repository = telegram.get("repository")
+    if repository is not None:
+        if not isinstance(repository, str) or not repository.strip() or "\x00" in repository:
+            raise ConfigError("telegram.repository должен быть непустым путём к каталогу или null.")
+        if admin_user_id is None:
+            raise ConfigError("Для telegram.repository укажите telegram.admin_user_id.")
     server = config.get("server")
     if not isinstance(server, dict):
         raise ConfigError("server должен быть JSON-объектом.")

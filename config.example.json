@@ -15,6 +15,10 @@
     "top_k": 4,
     "max_context_chars": 5000
   },
+  "telegram": {
+    "admin_user_id": null,
+    "repository": null
+  },
   "server": {
     "model_path": "models/huihui_ai--glm-4.7-flash-abliterated/Huihui-GLM-4.7-Flash-abliterated-ollama.Q4_K_M.llamacpp.gguf",
     "context_size": 8192,

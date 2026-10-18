@@ -1,4 +1,4 @@
-"""Private Telegram conversations backed by the client's approved tool harness."""
+"""Private or administrator-managed shared Telegram conversations."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import re
 import secrets
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,36 @@ from .telegram_api import TelegramAPI, TelegramError
 
 APPROVAL_TIMEOUT = 300.0
 BUTTON_TIMEOUT = 900.0
+MAX_SHARED_QUEUE = 100
+CLIENT_COMMAND_NAMES = {"/start", "/id", "/help", "/menu", "/status"}
+CLIENT_HELP = """/start — подключиться к общему диалогу
+/id — узнать свой Telegram ID
+/help — команды
+/menu — главное меню
+/status — состояние бота
+Отправьте текст запроса. Модель и контекст диалога общие для всех клиентов.
+Запросы выполняются по очереди; ответ приходит отправителю запроса.
+Инструменты, репозиторий и общий диалог настраивает администратор.
+Вызовы инструментов подтверждает только администратор."""
+ADMIN_HELP = """Режим admin + clients: одна модель, один репозиторий и общий контекст.
+Только администратор управляет моделью, инструментами, RAG и историей.
+/start, /menu — меню администратора
+/id — мой Telegram ID
+/help — команды
+/status — состояние общей сессии и инструментов
+/tools — подключить веб, код и PowerShell
+/tools repo ПАПКА — общий репозиторий (абсолютный путь или путь от корня проекта)
+/models — каталог, установка и выбор общей модели
+/system ТЕКСТ — системная инструкция и новый общий диалог
+/thinking — показать/скрыть рассуждения
+/rag — общая база знаний; документы загружает администратор
+/save [ФАЙЛ.json], /load ФАЙЛ.json — сохранить/загрузить общий диалог
+/history [НОМЕР] — история общих диалогов
+/clear — очистить общий диалог, сохранив инструменты и репозиторий
+/cancel — отменить текущий общий запрос
+/quit, /exit — отменить запрос, очистить очередь и общий диалог
+Ответы доставляются инициатору; каждый вызов инструмента подтверждается здесь.
+"""
 HELP = """/start — открыть свой чат
 /id — узнать свой Telegram username и ID
 /help — команды
@@ -66,6 +97,7 @@ COMMANDS = [
         ("quit", "Закрыть свой чат"), ("exit", "Закрыть свой чат"),
     )
 ]
+CLIENT_COMMANDS = [item for item in COMMANDS if "/" + item["command"] in CLIENT_COMMAND_NAMES]
 
 
 def _normalize_username(value: object) -> str | None:
@@ -152,6 +184,7 @@ class UserChat:
     close_requested: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     worker: threading.Thread | None = None
+    request_user_id: int | None = None
 
     @property
     def sessions(self) -> Path:
@@ -166,6 +199,7 @@ class PendingApproval:
     message_id: int | None = None
     allowed: bool = False
     expires: float = field(default_factory=lambda: time.monotonic() + APPROVAL_TIMEOUT)
+    requester_id: int | None = None
 
 
 @dataclass
@@ -256,8 +290,23 @@ class TelegramBot:
         # conversation and approval ownership remain bound to numeric IDs.
         self.usernames: dict[int, str | None] = {}
         self.clients: dict[int, ApiClient] = {}
+        self.admin_user_id: int | None = config.get("telegram", {}).get("admin_user_id")
+        if self.admin_user_id is not None and (type(self.admin_user_id) is not int or self.admin_user_id <= 0):
+            raise ValueError("telegram.admin_user_id должен быть положительным Telegram ID.")
+        self.shared_chat: UserChat | None = None
+        self.shared_queue: deque[tuple[int, int, str, dict | None]] = deque()
+        self.admin_commands_pending = False
+
+    @property
+    def shared_mode(self) -> bool:
+        return self.admin_user_id is not None
+
+    def is_admin(self, user_id: int) -> bool:
+        return type(user_id) is int and user_id == self.admin_user_id
 
     def allowed(self, user_id: int) -> bool:
+        if self.is_admin(user_id):
+            return True
         try:
             with self.control_lock:
                 username = self.usernames.get(user_id)
@@ -271,20 +320,21 @@ class TelegramBot:
         username = _normalize_username(sender.get("username"))
         with self.control_lock:
             displaced = [other for other, known in self.usernames.items()
-                         if username is not None and known == username and other != user_id]
+                         if username is not None and known == username and other != user_id
+                         and not self.is_admin(other)]
             for other in displaced:
                 self.usernames[other] = None
             self.usernames[user_id] = username
             revoked = displaced + ([] if self.allowed(user_id) else [user_id])
             for other in revoked:
                 user = self.users.get(other)
-                if user is not None:
+                if user is not None and (not self.shared_mode or user.request_user_id == other):
                     user.cancelled.set()
                 client = self.clients.get(other)
                 if client is not None:
                     client.cancel()
                 for pending in self.approvals.values():
-                    if pending.user_id == other:
+                    if pending.user_id == other or pending.requester_id == other:
                         pending.allowed = False
                         pending.event.set()
 
@@ -292,6 +342,23 @@ class TelegramBot:
         if type(user_id) is not int or user_id <= 0:
             raise ValueError("Неверный Telegram ID.")
         with self.control_lock:
+            if self.shared_mode:
+                if self.shared_chat is None:
+                    directory = self.root / ".local" / "telegram" / "shared"
+                    workspace = directory / "workspace"
+                    _make_directory(workspace, self.root)
+                    _make_directory(directory / ".local" / "sessions", self.root)
+                    config = copy.deepcopy(self.runtime.config)
+                    current = directory / "current.json"
+                    _no_links(current, self.root)
+                    messages = load_session(current) if current.exists() else initial_messages(config)
+                    config["system_prompt"] = next((m["content"] for m in messages if m["role"] == "system"), "")
+                    shared = UserChat(self.admin_user_id, directory, workspace, config, messages,
+                                      new_session_path(directory), RagSession(directory, config, boundary=workspace))
+                    self._restore_shared_settings(shared)
+                    self.shared_chat = shared
+                self.users[user_id] = self.shared_chat
+                return self.shared_chat
             if user_id not in self.users:
                 directory = self.root / ".local" / "telegram" / "users" / str(user_id)
                 workspace = directory / "workspace"
@@ -308,6 +375,73 @@ class TelegramBot:
                                               RagSession(directory, config, boundary=workspace))
             return self.users[user_id]
 
+    def _repository(self, value: str) -> Path:
+        value = value.strip().strip('"')
+        if not value:
+            raise ValueError("Укажите существующую папку общего репозитория.")
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.root / path
+        if ".." in path.parts or not path.is_dir():
+            raise ValueError("Укажите существующую папку репозитория без .. и ссылок.")
+        # The harness checks every path component with native no-follow handles.
+        return ToolHarness(HarnessSettings(code_enabled=True, repository=path), lambda request: False).settings.repository
+
+    def _restore_shared_settings(self, user: UserChat) -> None:
+        path = user.directory / "settings.json"
+        _no_links(path, self.root)
+        values = {}
+        if path.exists():
+            with path.open(encoding="utf-8") as source:
+                content = source.read(65537)
+            if len(content) > 65536:
+                raise ValueError("Настройки общего Telegram-чата слишком большие.")
+            values = json.loads(content)
+            if not isinstance(values, dict):
+                raise ValueError("Неверные настройки общего Telegram-чата.")
+        for name in ("web_enabled", "code_enabled", "powershell_enabled", "rag_enabled", "show_reasoning"):
+            if name in values and type(values[name]) is not bool:
+                raise ValueError("Неверный переключатель в настройках общего Telegram-чата.")
+        repository = values.get("repository")
+        if repository is not None and (not isinstance(repository, str) or not repository.strip()):
+            raise ValueError("Неверный репозиторий общего Telegram-чата.")
+        identity = values.get("repository_identity")
+        if identity is not None and (not isinstance(identity, list) or len(identity) != 3
+                                     or any(type(item) is not int or item < 0 for item in identity)):
+            raise ValueError("Неверный идентификатор общего репозитория.")
+        configured = self.runtime.config.get("telegram", {}).get("repository")
+        if configured is not None:
+            selected = self._repository(configured)
+            if repository != str(selected):
+                identity = None
+        else:
+            selected = self._repository(repository) if repository else user.workspace
+        settings = HarnessSettings(web_enabled=values.get("web_enabled", False),
+                                   code_enabled=values.get("code_enabled", False),
+                                   powershell_enabled=values.get("powershell_enabled", False),
+                                   repository=selected, repository_identity=tuple(identity) if identity else None)
+        if settings.code_enabled or settings.powershell_enabled:
+            settings = ToolHarness(settings, lambda request: False).settings
+        user.settings = settings
+        user.rag.enabled = values.get("rag_enabled", False)
+        user.config["show_reasoning"] = values.get("show_reasoning", user.config.get("show_reasoning", False))
+
+    def _save_shared_settings(self, user: UserChat) -> None:
+        if not self.shared_mode:
+            return
+        settings = user.settings
+        values = {"web_enabled": settings.web_enabled, "code_enabled": settings.code_enabled,
+                  "powershell_enabled": settings.powershell_enabled,
+                  "repository": str(settings.repository) if settings.repository else None,
+                  "repository_identity": settings.repository_identity, "rag_enabled": user.rag.enabled,
+                  "show_reasoning": bool(user.config.get("show_reasoning"))}
+        path = user.directory / "settings.json"
+        temporary = path.with_suffix(".json.tmp")
+        _no_links(path, self.root)
+        _no_links(temporary, self.root)
+        temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
     def _save(self, user: UserChat, path: Path | None = None) -> None:
         config = self.runtime.config
         for target in (path or user.session_path, user.directory / "current.json"):
@@ -320,9 +454,11 @@ class TelegramBot:
             self._save(user)
         user.messages = initial_messages(user.config)
         user.session_path = new_session_path(user.directory)
-        user.settings = HarnessSettings()
+        if not self.shared_mode:
+            user.settings = HarnessSettings()
         user.harness_status = None
-        user.rag.enabled = False
+        if not self.shared_mode:
+            user.rag.enabled = False
         with self.control_lock:
             self.buttons = {token: action for token, action in self.buttons.items() if action.user_id != user.user_id}
         _no_links(user.directory / "current.json", self.root)
@@ -332,18 +468,19 @@ class TelegramBot:
         return self.api.send_message(chat_id, text, reply_markup=reply_markup)
 
     def _menu(self, user: UserChat, chat_id: int, text: str,
-              rows: list[list[tuple[str, str]]]) -> None:
+              rows: list[list[tuple[str, str]]], *, owner_id: int | None = None) -> None:
+        owner_id = user.user_id if owner_id is None else owner_id
         tokens = []
         keyboard = []
         with self.control_lock:
             self.buttons = {token: action for token, action in self.buttons.items()
-                            if action.user_id != user.user_id and action.expires > time.monotonic()}
+                            if action.user_id != owner_id and action.expires > time.monotonic()}
             for row in rows:
                 buttons = []
                 for label, command in row:
                     token = secrets.token_urlsafe(12)
                     tokens.append(token)
-                    self.buttons[token] = CommandButton(user.user_id, chat_id, command)
+                    self.buttons[token] = CommandButton(owner_id, chat_id, command)
                     buttons.append({"text": label, "callback_data": "cmd:" + token})
                 keyboard.append(buttons)
         try:
@@ -361,8 +498,13 @@ class TelegramBot:
     def approve(self, user: UserChat, chat_id: int, request: ToolRequest) -> bool:
         if self._cancelled(user):
             return False
+        requester_id = user.request_user_id if self.shared_mode else user.user_id
+        if self.shared_mode:
+            chat_id = self.admin_user_id
         detail = request.summary + "\n\nАргументы модели:\n" + json.dumps(
             request.arguments, ensure_ascii=False, indent=2)
+        if self.shared_mode:
+            detail = f"Общая сессия · инициатор Telegram ID: {requester_id or user.user_id}\n\n" + detail
         if request.preview:
             heading = "Полный скрипт PowerShell:" if request.name == "powershell_run" else "Полное предлагаемое содержимое:"
             detail += "\n\n" + heading + "\n" + request.preview
@@ -370,6 +512,7 @@ class TelegramBot:
             detail += "\n\nРазрешены только вычисления и вывод. Файловые команды, сеть и запуск других программ запрещены."
         token = secrets.token_urlsafe(16)
         pending = PendingApproval(user.user_id, chat_id)
+        pending.requester_id = requester_id
         with self.control_lock:
             self.approvals[token] = pending
         try:
@@ -400,7 +543,32 @@ class TelegramBot:
                     pass
 
     def _cancelled(self, user: UserChat) -> bool:
-        return self.stopped.is_set() or user.cancelled.is_set() or not self.allowed(user.user_id)
+        actor = user.request_user_id if self.shared_mode else user.user_id
+        return self.stopped.is_set() or user.cancelled.is_set() or not self.allowed(actor or user.user_id)
+
+    def _client_command(self, chat_id: int, text: str) -> None:
+        command = text.split(maxsplit=1)[0]
+        if command == "/id":
+            username = self.usernames.get(chat_id)
+            self._send(chat_id, "Ваш Telegram username: " + ("@" + username if username else "не задан")
+                       + f"\nTelegram ID: {chat_id}")
+        elif command == "/status":
+            busy = self.shared_chat is not None and self.shared_chat.lock.locked()
+            self._send(chat_id, f"Модель: {self.runtime.config['target_model']}\n"
+                       "Сессия: общая для всех клиентов.\n"
+                       + ("Выполняется запрос." if busy else "Бот готов к запросам."))
+        elif command in {"/start", "/menu"}:
+            user = self.user_chat(chat_id)
+            self._menu(user, chat_id, CLIENT_HELP, [[("Состояние", "/status"), ("Помощь", "/help")]],
+                       owner_id=chat_id)
+        else:
+            self._send(chat_id, CLIENT_HELP)
+
+    def _require_admin(self, chat_id: int) -> bool:
+        if self.shared_mode and not self.is_admin(chat_id):
+            self._send(chat_id, "Эта операция доступна только администратору. Отправьте текст запроса или /help.")
+            return False
+        return True
 
     def handle_update(self, update: dict) -> None:
         if not isinstance(update, dict):
@@ -446,11 +614,76 @@ class TelegramBot:
             self._send(chat_id, f"Доступ запрещён. Ваш Telegram username: @{username}. Добавьте его в whitelist.txt на ПК клиента."
                        if username else "Доступ запрещён. Задайте username в настройках Telegram и добавьте его в whitelist.txt на ПК клиента.")
             return
+        if self.admin_commands_pending and self.is_admin(user_id) and text in {"/start", "/menu"}:
+            try:
+                self.api.set_commands(COMMANDS, scope={"type": "chat", "chat_id": user_id})
+                self.admin_commands_pending = False
+            except TelegramError:
+                self.emit("Telegram: меню администратора пока недоступно; команды можно вводить вручную.")
         self.dispatch(user_id, chat_id, text)
 
     def dispatch(self, user_id: int, chat_id: int, text: str,
                  *, document: dict | None = None) -> None:
         if self.stopped.is_set() or not self.allowed(user_id):
+            return
+        if self.shared_mode:
+            if not self.is_admin(user_id):
+                if document is not None or (text.startswith("/") and text.split(maxsplit=1)[0] not in CLIENT_COMMAND_NAMES):
+                    self._require_admin(chat_id)
+                    return
+                if text.startswith("/"):
+                    self._client_command(chat_id, text)
+                    return
+            user = self.user_chat(user_id)
+            if text in {"/help", "/status"}:
+                self.command(user, chat_id, text)
+                return
+            with self.control_lock:
+                if text in {"/cancel", "/quit", "/exit"} and user.lock.locked():
+                    if user.request_user_id is None:
+                        if text == "/cancel":
+                            if self.shared_queue:
+                                _, queued_chat, _, _ = self.shared_queue.popleft()
+                                self._send(queued_chat, "Запрос отменён администратором до выполнения.")
+                            self._send(chat_id, "Первый запрос очереди отменён.")
+                        else:
+                            discarded = list(self.shared_queue)
+                            self.shared_queue.clear()
+                            self._reset(user)
+                            user.close_requested.clear()
+                            for _, queued_chat, _, _ in discarded:
+                                self._send(queued_chat, "Запрос удалён из очереди: администратор закрыл общий диалог.")
+                            self._send(chat_id, "Общий диалог и очередь очищены; инструменты и репозиторий сохранены.")
+                        return
+                    user.cancelled.set()
+                    if text != "/cancel":
+                        user.close_requested.set()
+                        discarded = list(self.shared_queue)
+                        self.shared_queue.clear()
+                    else:
+                        discarded = []
+                    client = self.clients.get(user.request_user_id)
+                    if client is not None:
+                        client.cancel()
+                    for pending in self.approvals.values():
+                        pending.allowed = False
+                        pending.event.set()
+                    for _, queued_chat, _, _ in discarded:
+                        self._send(queued_chat, "Запрос удалён из очереди: администратор закрыл общий диалог.")
+                    self._send(chat_id, "Общий запрос отменяется." if text == "/cancel"
+                               else "Общий запрос отменяется; очередь и диалог будут очищены.")
+                    return
+                if len(self.shared_queue) >= MAX_SHARED_QUEUE:
+                    self._send(chat_id, "Очередь запросов заполнена. Повторите запрос позже.")
+                    return
+                self.shared_queue.append((user_id, chat_id, text, document))
+                if user.lock.locked():
+                    self._send(chat_id, f"Запрос добавлен в общую очередь. Перед ним запросов: {len(self.shared_queue)}.")
+                    return
+                user.lock.acquire()
+                user.worker = threading.Thread(target=self._shared_work, args=(user,),
+                                               name="telegram-shared", daemon=True)
+                user.worker.start()
             return
         user = self.user_chat(user_id)
         if text in {"/cancel", "/quit", "/exit"} and user.lock.locked():
@@ -475,6 +708,28 @@ class TelegramBot:
         user.worker = threading.Thread(target=self._work, args=arguments,
                                        name=f"telegram-user-{user_id}", daemon=True)
         user.worker.start()
+
+    def _shared_work(self, user: UserChat) -> None:
+        released = False
+        try:
+            while True:
+                with self.control_lock:
+                    if self.stopped.is_set() or not self.shared_queue:
+                        user.request_user_id = None
+                        user.lock.release()
+                        released = True
+                        return
+                    user_id, chat_id, text, document = self.shared_queue.popleft()
+                    if not self.allowed(user_id):
+                        continue
+                    user.request_user_id = user_id
+                    user.cancelled.clear()
+                self._work(user, chat_id, text, document, release_lock=False)
+        finally:
+            if not released:
+                with self.control_lock:
+                    user.request_user_id = None
+                    user.lock.release()
 
     def _callback(self, callback: dict) -> None:
         callback_id = callback.get("id")
@@ -504,6 +759,7 @@ class TelegramBot:
                     parts = data.split(":")
                     pending = self.approvals.get(parts[1]) if len(parts) == 3 else None
                     if (pending and parts[2] in {"yes", "no"} and pending.user_id == user_id
+                            and (not self.shared_mode or self.is_admin(user_id))
                             and pending.chat_id == chat_id and pending.message_id == message_id
                             and time.monotonic() < pending.expires and not pending.event.is_set()):
                         pending.allowed = parts[2] == "yes"
@@ -513,6 +769,8 @@ class TelegramBot:
                     token = data[4:]
                     button = self.buttons.get(token)
                     if (button and button.user_id == user_id and button.chat_id == chat_id
+                            and (not self.shared_mode or self.is_admin(user_id)
+                                 or button.command.split(maxsplit=1)[0] in CLIENT_COMMAND_NAMES)
                             and button.message_id == message_id and time.monotonic() < button.expires):
                         self.buttons.pop(token)
                         command = button.command
@@ -529,7 +787,7 @@ class TelegramBot:
             self.dispatch(user_id, chat_id, command)
 
     def _work(self, user: UserChat, chat_id: int, text: str,
-              document: dict | None = None) -> None:
+              document: dict | None = None, *, release_lock: bool = True) -> None:
         user.harness_status = None
         try:
             if not self._cancelled(user):
@@ -558,21 +816,32 @@ class TelegramBot:
         except TelegramError:
             self.emit(f"Telegram: ошибка доставки пользователю {user.user_id}.")
         finally:
-            if user.close_requested.is_set():
-                try:
-                    self._reset(user)
-                    self._send(chat_id, "Ваш чат закрыт. /start — открыть новый.")
-                except (TelegramError, OSError, ValueError):
-                    self.emit(f"Telegram: не удалось завершить закрытие чата {user.user_id}.")
-                user.close_requested.clear()
-            user.lock.release()
+            with self.control_lock:
+                if user.close_requested.is_set():
+                    try:
+                        self._reset(user)
+                        self._send(chat_id, "Общий диалог очищен; инструменты и репозиторий сохранены." if self.shared_mode
+                                   else "Ваш чат закрыт. /start — открыть новый.")
+                    except (TelegramError, OSError, ValueError):
+                        self.emit(f"Telegram: не удалось завершить закрытие чата {user.user_id}.")
+                    user.close_requested.clear()
+                if self.shared_mode and not release_lock:
+                    user.request_user_id = None
+            if release_lock:
+                user.lock.release()
 
     def command(self, user: UserChat, chat_id: int, text: str) -> None:
         parts = text.split(maxsplit=1)
         command, argument = parts[0], parts[1] if len(parts) > 1 else ""
         argument = argument.strip()
+        if self.shared_mode and not self.is_admin(chat_id):
+            if command in CLIENT_COMMAND_NAMES and self.allowed(chat_id):
+                self._client_command(chat_id, text)
+            else:
+                self._require_admin(chat_id)
+            return
         if command == "/help":
-            self._send(chat_id, HELP)
+            self._send(chat_id, ADMIN_HELP if self.shared_mode else HELP)
         elif command == "/status":
             harness = user.harness_status or HarnessStatus(settings=user.settings)
             self._send(chat_id, f"Модель: {self.runtime.config['target_model']}\n"
@@ -582,8 +851,10 @@ class TelegramBot:
         elif command in {"/start", "/menu"}:
             if command == "/menu":
                 self._save(user)
-            self._menu(user, chat_id, f"llmopenchat\nМодель: {self.runtime.config['target_model']}\n"
-                       f"Рабочая директория: {user.workspace}\n/help — все команды", [
+            self._menu(user, chat_id, ("Администратор · общая сессия\n" if self.shared_mode else "")
+                       + f"llmopenchat\nМодель: {self.runtime.config['target_model']}\n"
+                       + (f"Общий репозиторий: {user.settings.repository or user.workspace}\n" if self.shared_mode
+                          else f"Рабочая директория: {user.workspace}\n") + "/help — все команды", [
                 [("Новый диалог", "/clear"), ("История", "/history")],
                 [("Харнесы", "/tools"), ("Модели", "/models")],
                 [("База знаний RAG", "/rag"), ("Состояние", "/status")],
@@ -593,10 +864,12 @@ class TelegramBot:
             if command == "/system":
                 user.config["system_prompt"] = argument
             self._reset(user)
-            self._send(chat_id, "Ваш чат закрыт. /start — открыть новый." if command in {"/quit", "/exit"}
+            self._send(chat_id, "Общий диалог очищен. Инструменты, репозиторий и RAG сохранены." if self.shared_mode
+                       else "Ваш чат закрыт. /start — открыть новый." if command in {"/quit", "/exit"}
                        else "Начат новый диалог. Харнесы и RAG отключены; /tools и /rag — подключение.")
         elif command == "/thinking":
             user.config["show_reasoning"] = not user.config.get("show_reasoning", False)
+            self._save_shared_settings(user)
             self._send(chat_id, "Рассуждения: " + ("показаны" if user.config["show_reasoning"] else "скрыты"))
         elif command == "/cancel":
             self._send(chat_id, "Сейчас нет выполняющегося запроса.")
@@ -615,7 +888,9 @@ class TelegramBot:
             user.messages = messages
             user.config["system_prompt"] = next((m["content"] for m in messages if m["role"] == "system"), "")
             self._save(user)
-            self._send(chat_id, f"Загружено сообщений: {len(messages)}. Харнесы и RAG отключены; /tools и /rag — подключение.")
+            self._send(chat_id, f"Загружено сообщений: {len(messages)}. "
+                       + ("Общий контекст заменён; инструменты и RAG сохранены." if self.shared_mode
+                          else "Харнесы и RAG отключены; /tools и /rag — подключение."))
         elif command == "/history":
             _no_links(user.sessions, self.root)
             for path in user.sessions.glob("*.json"):
@@ -644,11 +919,14 @@ class TelegramBot:
             self._send(chat_id, "Неизвестная команда. /help — список команд.")
 
     def rag(self, user: UserChat, chat_id: int, argument: str) -> None:
+        if not self._require_admin(chat_id):
+            return
         action, _, value = argument.partition(" ")
         if action == "add":
             path = _relative_path(user.workspace, value)
             argument = "add " + str(path)
         result = user.rag.command(argument)
+        self._save_shared_settings(user)
         if argument:
             self._send(chat_id, result)
             return
@@ -656,7 +934,8 @@ class TelegramBot:
                    f"Или положите файл на ПК в {user.workspace}\n"
                    "/rag add ФАЙЛ — импортировать относительный путь из этого каталога.\n"
                    "/rag search ЗАПРОС — проверить поиск; /rag remove ID — удалить документ.\n"
-                   "/rag clear — очистить базу знаний; /clear сохраняет документы и отключает RAG.", [
+                   + ("/rag clear — очистить общую базу знаний; /clear сохраняет документы и настройки RAG." if self.shared_mode
+                      else "/rag clear — очистить базу знаний; /clear сохраняет документы и отключает RAG."), [
             [("Выключить RAG" if user.rag.enabled else "Включить RAG",
               "/rag " + ("off" if user.rag.enabled else "on"))],
             [("Документы", "/rag list"), ("Состояние", "/status")],
@@ -664,6 +943,8 @@ class TelegramBot:
 
     def add_document(self, user: UserChat, chat_id: int, document: dict) -> None:
         """Import an explicitly uploaded document into this user's knowledge base."""
+        if not self._require_admin(chat_id):
+            return
         filename, file_id = document.get("file_name"), document.get("file_id")
         if (not isinstance(filename, str) or not filename or len(filename) > 180
                 or "/" in filename or "\\" in filename):
@@ -700,6 +981,8 @@ class TelegramBot:
                    + ("RAG включён." if user.rag.enabled else "/rag on — включить поиск в ответах."))
 
     def tools(self, user: UserChat, chat_id: int, argument: str) -> None:
+        if not self._require_admin(chat_id):
+            return
         action, _, value = argument.partition(" ")
         value = value.strip()
         settings = user.settings
@@ -710,20 +993,22 @@ class TelegramBot:
             if action in {"code", "powershell"} and settings.repository is None:
                 settings = replace(settings, repository=user.workspace)
         elif action == "repo":
-            repository = _relative_path(user.workspace, value, directory=True)
+            repository = (self._repository(value) if self.shared_mode
+                          else _relative_path(user.workspace, value, directory=True))
             if not repository.is_dir():
                 raise ValueError("Папка должна существовать внутри вашей рабочей директории.")
             checked = ToolHarness(replace(settings, code_enabled=True, repository=repository,
                                           repository_identity=None), lambda request: False)
             settings = replace(checked.settings, code_enabled=settings.code_enabled)
         elif action == "off":
-            settings = HarnessSettings()
+            settings = HarnessSettings(repository=settings.repository, repository_identity=settings.repository_identity) if self.shared_mode else HarnessSettings()
         elif action:
             raise ValueError("/tools: web on|off, code on|off, powershell on|off, repo ПАПКА или off.")
         if settings.code_enabled or settings.powershell_enabled:
             checked = ToolHarness(settings, lambda request: False)
             settings = checked.settings
         user.settings = settings
+        self._save_shared_settings(user)
         self._menu(user, chat_id, "Харнесы текущего чата\n"
                    f"Веб: {'включён' if settings.web_enabled else 'выключен'}\n"
                    f"Код: {'включён' if settings.code_enabled else 'выключен'}\n"
@@ -731,7 +1016,8 @@ class TelegramBot:
                    f"Директория: {settings.repository or user.workspace}\n"
                    "Каждое чтение, поиск, запись, создание каталога, веб-запрос и запуск PowerShell требуют апрува.\n"
                    "PowerShell: только вычисления и вывод; файловые команды, сеть и другие программы запрещены.\n"
-                   "/tools repo ПАПКА — выбрать подпапку своей рабочей директории.", [
+                   + ("/tools repo ПАПКА — общий репозиторий: абсолютный путь или путь от корня проекта." if self.shared_mode
+                      else "/tools repo ПАПКА — выбрать подпапку своей рабочей директории."), [
             [("Выключить веб" if settings.web_enabled else "Включить веб",
               "/tools web " + ("off" if settings.web_enabled else "on"))],
             [("Выключить код" if settings.code_enabled else "Включить код",
@@ -742,6 +1028,8 @@ class TelegramBot:
         ])
 
     def models(self, user: UserChat, chat_id: int, argument: str) -> None:
+        if not self._require_admin(chat_id):
+            return
         def progress(value: str) -> None:
             if self._cancelled(user):
                 raise GenerationCancelled("Операция с моделью отменена.")
@@ -818,7 +1106,7 @@ class TelegramBot:
     def generate(self, user: UserChat, chat_id: int, prompt: str) -> None:
         harness_status = HarnessStatus(settings=user.settings)
         user.harness_status = harness_status
-        accepted = "Запрос принят. /cancel — отменить."
+        accepted = "Запрос выполняется в общей сессии." if self.shared_mode else "Запрос принят. /cancel — отменить."
         if harness_status.enabled:
             accepted += "\n" + harness_status.connection()
         if user.rag.enabled:
@@ -870,8 +1158,9 @@ class TelegramBot:
                 user.settings = harness.settings
                 harness_status.configure(harness.settings)
             client = ApiClient(config)
+            requester_id = user.request_user_id if self.shared_mode else user.user_id
             with self.control_lock:
-                self.clients[user.user_id] = client
+                self.clients[requester_id or user.user_id] = client
             rag_options = {"rag": user.rag} if user.rag.enabled else {}
             result = generate_response(client, proposed, harness=harness,
                                        on_event=on_event, cancelled=lambda: self._cancelled(user),
@@ -893,7 +1182,7 @@ class TelegramBot:
             raise
         finally:
             with self.control_lock:
-                self.clients.pop(user.user_id, None)
+                self.clients.pop(user.request_user_id or user.user_id, None)
             self.runtime.lock.release()
 
     def poll(self) -> None:
@@ -922,6 +1211,7 @@ class TelegramBot:
     def close(self) -> None:
         self.stopped.set()
         with self.control_lock:
+            self.shared_queue.clear()
             for user in self.users.values():
                 user.cancelled.set()
             for pending in self.approvals.values():
@@ -929,7 +1219,7 @@ class TelegramBot:
             for client in self.clients.values():
                 client.cancel()
         deadline = time.monotonic() + 2
-        for user in list(self.users.values()):
+        for user in {id(user): user for user in self.users.values()}.values():
             if user.worker is not None:
                 user.worker.join(timeout=max(0, deadline - time.monotonic()))
 
@@ -947,12 +1237,28 @@ def run_telegram(config: dict, root: Path, *, whitelist_path: Path | None = None
     runtime = BotRuntime(config, root, emit)
     try:
         token = read_token(credits_path)
-        allowed = read_whitelist(whitelist_path)
+        admin_user_id = config.get("telegram", {}).get("admin_user_id")
+        allowed = (set() if admin_user_id is not None and not whitelist_path.exists()
+                   else read_whitelist(whitelist_path))
         api = TelegramAPI(token)
         identity = api.get_me()
-        api.set_commands(COMMANDS)
+        admin_commands_pending = False
+        if admin_user_id is not None:
+            api.set_commands(CLIENT_COMMANDS)
+            try:
+                api.set_commands(COMMANDS, scope={"type": "chat", "chat_id": admin_user_id})
+            except TelegramError as error:
+                if error.error_code != 400 or "chat not found" not in str(error).casefold():
+                    raise
+                admin_commands_pending = True
+                emit("Telegram: администратору нужно открыть личный чат с ботом через /start.")
+        else:
+            api.set_commands(COMMANDS)
         bot = TelegramBot(api, config, root, whitelist_path, runtime=runtime, emit=emit)
         bot.username = identity.get("username", "")
+        bot.admin_commands_pending = admin_commands_pending
+        if admin_user_id is not None:
+            bot.user_chat(admin_user_id)
         runtime.start()
         emit(f"Telegram-бот @{bot.username} запущен. Разрешено пользователей: {len(allowed)}. Ctrl+C — остановить.")
         bot.poll()
@@ -960,7 +1266,7 @@ def run_telegram(config: dict, root: Path, *, whitelist_path: Path | None = None
     except KeyboardInterrupt:
         emit("Telegram-бот остановлен.")
         return 0
-    except (TelegramError, RuntimeErrorDetail, OSError, ValueError) as error:
+    except (TelegramError, HarnessError, RuntimeErrorDetail, OSError, ValueError) as error:
         emit(f"Ошибка Telegram-бота: {error}")
         return 1
     finally:

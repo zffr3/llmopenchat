@@ -71,6 +71,35 @@ class TelegramEntryTests(unittest.TestCase):
         server.assert_not_called()
         chat.assert_not_called()
 
+    def test_admin_id_override_enables_shared_mode_without_saving_config(self):
+        result, bot, server, chat = self.invoke(["telegram", "--admin-id", "123456789"])
+        self.assertEqual(result, 0)
+        self.assertEqual(bot.call_args.args[0]["telegram"]["admin_user_id"], 123456789)
+        self.assertIsNone(self.config["telegram"]["admin_user_id"])
+        self.assertIsNone(cli.load_config(self.path)["telegram"]["admin_user_id"])
+        server.assert_not_called()
+        chat.assert_not_called()
+
+    def test_admin_id_override_preserves_configured_shared_repository(self):
+        self.config["telegram"] = {"admin_user_id": 111, "repository": "shared-repo"}
+        write_config(self.path, self.config)
+        result, bot, _, _ = self.invoke(["telegram", "--admin-id", "222"])
+        self.assertEqual(result, 0)
+        self.assertEqual(bot.call_args.args[0]["telegram"], {
+            "admin_user_id": 222, "repository": "shared-repo",
+        })
+        self.assertEqual(cli.load_config(self.path)["telegram"], self.config["telegram"])
+
+    def test_invalid_admin_ids_fail_before_launch(self):
+        for user_id in ("0", "-123"):
+            with self.subTest(user_id=user_id):
+                result, bot, server, chat = self.invoke(["telegram", "--admin-id", user_id])
+                self.assertEqual(result, 1)
+                bot.assert_not_called()
+                server.assert_not_called()
+                chat.assert_not_called()
+        self.assertIn("telegram.admin_user_id", self.output.getvalue())
+
     def test_menu_launches_bot_and_returns_to_menu(self):
         result, bot, server, chat = self.invoke([], ["4", "0"], status=130)
         self.assertEqual(result, 0)
@@ -101,6 +130,8 @@ class TelegramEntryTests(unittest.TestCase):
         self.assertIn("--whitelist", self.output.getvalue())
         self.assertIn("Telegram username", self.output.getvalue())
         self.assertIn("--credits", self.output.getvalue())
+        self.assertIn("--admin-id", self.output.getvalue())
+        self.assertIn("/id", self.output.getvalue())
         load.assert_not_called()
         bot.assert_not_called()
         server.assert_not_called()

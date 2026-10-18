@@ -291,8 +291,11 @@ class TelegramAPI:
             },
         )
 
-    def set_commands(self, commands: list[dict]) -> Any:
-        return self.call("setMyCommands", {"commands": commands})
+    def set_commands(self, commands: list[dict], *, scope: dict | None = None) -> Any:
+        payload = {"commands": commands}
+        if scope is not None:
+            payload["scope"] = scope
+        return self.call("setMyCommands", payload)
 
     def get_me(self) -> dict:
         result = self.call("getMe")
