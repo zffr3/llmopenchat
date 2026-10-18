@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import queue
 import unittest
 from unittest.mock import patch
 
-from llmopenchat.runtime import ManagedServer, RuntimeErrorDetail
+from llmopenchat.runtime import ManagedServer, RuntimeErrorDetail, _owned_linux_command
 
 
 @contextmanager
@@ -230,6 +231,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
     def test_llama_command_explicitly_disables_native_tools_from_system_config(self):
         executable, model = self.root / "llama-server.exe", self.root / "model.gguf"
         executable.write_bytes(b"runtime")
+        executable.chmod(0o755)
         model.write_bytes(b"weights")
         runtime = ManagedServer(self.config(
             "http://127.0.0.1:8081/v1", executable=str(executable), model_path=str(model),
@@ -255,6 +257,115 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     child_environment = popen.call_args.kwargs["env"]
                     self.assertNotIn("LLAMA_ARG_TOOLS", child_environment)
                     self.assertNotIn("LLAMA_ARG_AGENT", child_environment)
+
+    def test_linux_runtime_adds_its_bundled_libraries_to_child_environment(self):
+        executable = self.root / ".local/runtime/cpu/llama-server"
+        runtime = ManagedServer(self.config("http://127.0.0.1:8081/v1", executable=str(executable)), self.root)
+        with patch("llmopenchat.runtime.sys.platform", "linux"), patch.dict(os.environ, {"LD_LIBRARY_PATH": "/opt/gpu/lib"}):
+            self.assertEqual(runtime._child_environment()["LD_LIBRARY_PATH"], str(executable.parent.resolve()) + os.pathsep + "/opt/gpu/lib")
+
+    def test_linux_guardian_python_is_isolated_from_project_imports(self):
+        command = ["/opt/runtime/llama-server", "--model", "/opt/model.gguf"]
+        wrapped = _owned_linux_command(command)
+        self.assertEqual(wrapped[:3], [sys.executable, "-I", "-c"])
+        self.assertEqual(wrapped[4], str(os.getpid()))
+        self.assertEqual(wrapped[5:], command)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process-group integration")
+    def test_linux_server_outlives_its_starting_worker_thread(self):
+        runtime = ScriptRuntime(self.config(f"http://127.0.0.1:{unused_port()}/v1", startup_timeout=5), self.root)
+        errors = []
+        def start():
+            try:
+                runtime.__enter__()
+            except BaseException as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=start)
+        try:
+            worker.start()
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            time.sleep(0.3)
+            self.assertEqual(runtime._read_models(), ["test-model"])
+            self.assertIsNone(runtime.created_process.poll())
+        finally:
+            runtime.stop()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process-group integration")
+    def test_linux_hard_parent_termination_kills_owned_server(self):
+        port = unused_port()
+        script = f"""
+import json, sys, time
+from pathlib import Path
+from llmopenchat.runtime import ManagedServer
+class Runtime(ManagedServer):
+    def _build_command(self):
+        return [sys.executable, '-u', '-c', {SERVER_SCRIPT!r}, str(self._port)]
+config = {{'backend': 'llama_cpp', 'model': 'test-model',
+          'base_url': 'http://127.0.0.1:{port}/v1', 'server': {{'startup_timeout': 5}}}}
+with Runtime(config, Path(sys.argv[1]), emit=lambda message: None) as runtime:
+    print(json.dumps({{'child_pid': runtime._process.pid}}), flush=True)
+    time.sleep(60)
+"""
+        parent = subprocess.Popen([sys.executable, "-u", "-c", script, str(self.root)],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        lines = queue.Queue()
+        reader = threading.Thread(target=lambda: lines.put(parent.stdout.readline()), daemon=True)
+        reader.start()
+        runtime = ManagedServer(self.config(f"http://127.0.0.1:{port}/v1"), self.root)
+        child_pid = None
+        try:
+            line = lines.get(timeout=10)
+            self.assertTrue(line, "Parent failed before server readiness")
+            child_pid = json.loads(line)["child_pid"]
+            self.assertTrue(runtime._port_is_open())
+            parent.kill()  # No Python cleanup can run in the owner.
+            parent.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while runtime._port_is_open() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(runtime._port_is_open(), "Owned server survived its owner")
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=5)
+            if child_pid is not None:
+                try:
+                    os.killpg(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            parent.stdout.close()
+            parent.stderr.close()
+            reader.join(timeout=1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process-group integration")
+    def test_linux_cleanup_reaps_workers_after_the_server_leader_exits(self):
+        child_file = self.root / "worker.pid"
+        script = f"""
+import pathlib, subprocess, sys
+worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+pathlib.Path({str(child_file)!r}).write_text(str(worker.pid))
+sys.exit(3)
+"""
+        runtime = ScriptRuntime(self.config(f"http://127.0.0.1:{unused_port()}/v1", startup_timeout=5), self.root, script)
+        with self.assertRaisesRegex(RuntimeErrorDetail, "кодом 3"):
+            with runtime:
+                self.fail("Exited server must not be accepted")
+        pid = int(child_file.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status = Path(f"/proc/{pid}/stat")
+            try:
+                state = status.read_text().rsplit(")", 1)[1].split()[0]
+            except FileNotFoundError:
+                break
+            if state == "Z":
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            self.fail("Worker survived exited server cleanup")
 
     def test_bundled_llama_parses_safety_overrides_without_enabling_tools(self):
         executable = Path(__file__).resolve().parents[1] / ".local/runtime/llama-b11445-vulkan/llama-server.exe"

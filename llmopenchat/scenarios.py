@@ -18,7 +18,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from referencing import Registry
 from referencing.exceptions import NoSuchResource, Unresolvable
 
-from ._winfiles import FileAccessError, LockedHandle, LockedRepository, supported
+from ._files import FileAccessError, LockedRepository, supported
 from .harness import HarnessSettings, ToolRequest
 
 
@@ -103,9 +103,9 @@ def load_hosts(path: Path) -> HostPolicy:
         if not regular(before):
             raise ScenarioError("hosts.txt должен быть обычным файлом без ссылок и reparse points.")
         if supported():
-            # Pin every ancestor and read through an exclusive native handle.
-            # No ancestor can be renamed or become a junction during the read.
-            with LockedRepository(path.parent), LockedHandle(path) as handle:
+            # Both native backends pin ancestors and refuse to follow links.
+            # Linux also opens nonblocking before rejecting FIFOs/devices.
+            with LockedRepository(path.parent) as repository, repository.open_file((path.name,)) as handle:
                 raw = handle.read(MAX_HOSTS_BYTES)
         else:
             with path.open("rb") as handle:

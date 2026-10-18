@@ -24,7 +24,7 @@ import uuid
 
 from .config import DEFAULT_CONFIG, write_config
 from .download import DownloadError, _digest, download_file
-from .setup import SetupError, _install_runtime, _sha256
+from .setup import SetupError, _install_runtime, _runtime_spec, _sha256
 
 
 _GIB = 1024**3
@@ -672,8 +672,10 @@ class ModelManager:
             return self._install(model_id, quant, emit)
 
     def _install(self, model_id: str, quant: str, emit: Callable[[str], None] | None) -> dict:
-        if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
-            raise ModelError("Установка рассчитана на Windows x64 с Vulkan; модели GGUF нельзя запустить этим установщиком на другой платформе.")
+        try:
+            _runtime_spec()
+        except SetupError as exc:
+            raise ModelError(str(exc)) from exc
         plan = self.inspect(model_id, quant)
         data = self._load()
         existing = data["packages"].get(plan["id"])
@@ -698,7 +700,7 @@ class ModelManager:
                     raise ModelError(f"Размер или SHA256 модели не совпал: {file['filename']}.")
             executable = self._inside(_install_runtime(self.root, progress))
             if not executable.is_file():
-                raise ModelError("Установка среды не создала llama-server.exe.")
+                raise ModelError("Установка среды не создала llama-server.")
             record = {**plan, "executable": executable.relative_to(self.root).as_posix()}
             data["packages"][record["id"]] = record
             self._save(data)

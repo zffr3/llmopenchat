@@ -6,11 +6,25 @@ import copy
 import json
 import math
 from pathlib import Path
+import sys
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REPO = "mradermacher/Huihui-GLM-4.7-Flash-abliterated-GGUF"
 DEFAULT_FILE = "Huihui-GLM-4.7-Flash-abliterated.Q4_K_M.gguf"
+
+
+def _default_executable() -> str:
+    if sys.platform.startswith("linux"):
+        from .setup import SetupError, _runtime_spec
+        try:
+            spec = _runtime_spec()
+        except SetupError:
+            return ".local/runtime/llama-server"
+        return f".local/runtime/{spec['directory']}/llama-server"
+    return ".local/runtime/llama-b11445-vulkan/llama-server.exe"
+
+
 DEFAULT_CONFIG = {
     "backend": "llama_cpp",
     "base_url": "http://127.0.0.1:8081/v1",
@@ -29,7 +43,7 @@ DEFAULT_CONFIG = {
         "max_context_chars": 5000,
     },
     "server": {
-        "executable": ".local/runtime/llama-b11445-vulkan/llama-server.exe",
+        "executable": _default_executable(),
         "model_path": "models/huihui_ai--glm-4.7-flash-abliterated/Huihui-GLM-4.7-Flash-abliterated-ollama.Q4_K_M.llamacpp.gguf",
         "context_size": 8192,
         "gpu_layers": "auto",

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import tarfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -193,6 +194,8 @@ class SetupTests(unittest.TestCase):
         asset = self.asset(archive.read_bytes())
         with (
             patch.object(setup, "_ASSETS", (asset,)),
+            patch.object(setup, "os", SimpleNamespace(name="nt")),
+            patch.object(setup.platform, "machine", return_value="AMD64"),
             patch.object(setup.urllib.request, "urlopen") as network,
         ):
             executable = setup._install_runtime(self.root, self.emit)
@@ -209,10 +212,91 @@ class SetupTests(unittest.TestCase):
         with zipfile.ZipFile(archive, "w") as compressed:
             compressed.writestr("llama-server.exe", b"server without GPU backend")
         asset = self.asset(archive.read_bytes())
-        with patch.object(setup, "_ASSETS", (asset,)):
+        with patch.object(setup, "_ASSETS", (asset,)), patch.object(setup, "os", SimpleNamespace(name="nt")), patch.object(setup.platform, "machine", return_value="AMD64"):
             with self.assertRaisesRegex(setup.SetupError, "ggml-vulkan.dll"):
                 setup._install_runtime(self.root, self.emit)
         self.assertFalse((self.root / f".local/runtime/llama-{setup.LLAMA_RELEASE}-vulkan").exists())
+
+
+class LinuxRuntimeSetupTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+
+    def spec(self, machine="x86_64", backend=None):
+        environment = {} if backend is None else {"LLMOPENCHAT_RUNTIME_BACKEND": backend}
+        with patch.object(setup, "os", SimpleNamespace(name="posix", environ=environment)), patch.object(setup.platform, "system", return_value="Linux"), patch.object(setup.platform, "machine", return_value=machine):
+            return setup._runtime_spec()
+
+    def archive(self, entries):
+        path = self.root / "test.tar.gz"
+        with tarfile.open(path, "w:gz") as compressed:
+            for name, kind, value in entries:
+                member = tarfile.TarInfo(name)
+                member.mode = 0o755 if name.endswith("llama-server") else 0o644
+                if kind == "file":
+                    member.size = len(value)
+                    compressed.addfile(member, io.BytesIO(value))
+                else:
+                    member.type = {"symlink": tarfile.SYMTYPE, "hardlink": tarfile.LNKTYPE, "fifo": tarfile.FIFOTYPE}[kind]
+                    member.linkname = value
+                    compressed.addfile(member)
+        return path
+
+    def test_verified_bundles_cover_cpu_vulkan_and_cuda_on_both_architectures(self):
+        for machine in ("x86_64", "aarch64"):
+            for backend in ("cpu", "vulkan", "cuda", "cuda13"):
+                with self.subTest(machine=machine, backend=backend):
+                    spec = self.spec(machine, backend)
+                    self.assertEqual(spec["platform"], "linux")
+                    self.assertEqual(spec["executable"], "llama-server")
+                    self.assertTrue(all(asset["size"] > 0 and len(asset["sha256"]) == 64 for asset in spec["assets"]))
+                    self.assertEqual(len(spec["assets"]), 2 if backend.startswith("cuda") else 1)
+        self.assertEqual(self.spec()["backend"], "cpu")
+        self.assertIn("12.8", self.spec(backend="cuda")["assets"][0]["name"])
+        self.assertIn("13.4", self.spec("aarch64", "cuda")["assets"][0]["name"])
+        with self.assertRaises(setup.SetupError):
+            self.spec("x86_64", "typo")
+        with self.assertRaises(setup.SetupError):
+            self.spec("i686")
+
+    def test_tar_rejects_traversal_links_outside_archive_and_special_files(self):
+        for entries in (
+            [("../escape", "file", b"bad")],
+            [("/absolute", "file", b"bad")],
+            [("C:/drive", "file", b"bad")],
+            [("link", "symlink", "../escape")],
+            [("link", "hardlink", "/etc/passwd")],
+            [("link", "symlink", "missing")],
+            [("a", "symlink", "b"), ("b", "symlink", "a")],
+            [("fifo", "fifo", "")],
+        ):
+            with self.subTest(entries=entries):
+                with self.assertRaises(setup.SetupError):
+                    setup._extract_archive(self.archive(entries), self.root / "target")
+        self.assertFalse((self.root / "escape").exists())
+
+    def test_linux_runtime_materializes_library_links_and_reuses_installation(self):
+        archive = self.archive([
+            ("llama-b11445/llama-server", "file", b"server"),
+            ("llama-b11445/libggml.so.0", "file", b"backend"),
+            ("llama-b11445/libggml.so", "symlink", "libggml.so.0"),
+        ])
+        spec = self.spec()
+        asset = {"name": archive.name, "size": archive.stat().st_size, "sha256": setup._sha256(archive)}
+        spec["assets"] = (asset,)
+        downloads = self.root / ".local/downloads"
+        downloads.mkdir(parents=True)
+        archive.replace(downloads / asset["name"])
+        with patch.object(setup, "_runtime_spec", return_value=spec), patch.object(setup.urllib.request, "urlopen") as fetch:
+            executable = setup._install_runtime(self.root, lambda message: None)
+            self.assertEqual(executable, self.root / ".local/runtime" / spec["directory"] / "llama-server")
+            self.assertEqual(executable.read_bytes(), b"server")
+            self.assertEqual((executable.parent / "libggml.so").read_bytes(), b"backend")
+            self.assertFalse((executable.parent / "libggml.so").is_symlink())
+            self.assertEqual(setup._install_runtime(self.root, lambda message: None), executable)
+        fetch.assert_not_called()
 
 
 if __name__ == "__main__":

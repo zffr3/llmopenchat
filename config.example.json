@@ -16,7 +16,6 @@
     "max_context_chars": 5000
   },
   "server": {
-    "executable": ".local/runtime/llama-b11445-vulkan/llama-server.exe",
     "model_path": "models/huihui_ai--glm-4.7-flash-abliterated/Huihui-GLM-4.7-Flash-abliterated-ollama.Q4_K_M.llamacpp.gguf",
     "context_size": 8192,
     "gpu_layers": "auto",

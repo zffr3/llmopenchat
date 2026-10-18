@@ -6,7 +6,7 @@
 
 ## Возможности
 
-- Локальные модели через управляемый сервер llama.cpp с Vulkan; подключение к внешнему API и установленному vLLM на Linux.
+- Локальные модели через управляемый сервер llama.cpp: Windows Vulkan, Linux CPU/Vulkan/CUDA; подключение к внешнему API и установленному vLLM на Linux.
 - Каталог GGUF-моделей: загрузка выбранного квантования, проверка SHA256, переключение и удаление пакетов.
 - Терминальный чат с горячими клавишами, сохранением и продолжением диалогов.
 - Telegram-бот с персональными диалогами, файлами и базой знаний пользователей.
@@ -14,6 +14,74 @@
 - RAG: локальный поиск BM25 по текстам, исходникам, HTML, PDF и DOCX.
 - Сценарии с проверкой JSON Schema: текст, stdin, файлы, отправка результата POST и входящий вебхук.
 - Подготовка JSONL-датасетов и отдельный процесс LoRA/QLoRA-дообучения.
+
+## Быстрый запуск на Linux
+
+Клиент, Telegram-бот, инструменты файлов и PowerShell, RAG, сценарии, вебхуки и подготовка/запуск обучения поддерживают Linux. Для клиента нужен Python **3.10+**. Автоустановка llama.cpp поддерживает **x86_64 и ARM64** и использует официальные архивы Ubuntu с проверкой SHA256. Для x86_64 рекомендуется Ubuntu 22.04 или новее; ARM64-архивы собраны на Ubuntu 24.04 с GCC 14 и требуют соответствующей `libstdc++`. На другом дистрибутиве можно собрать llama.cpp самостоятельно и указать `server.executable` либо подключить внешний API.
+
+Пример для Ubuntu/Debian, из каталога проекта, под обычным пользователем:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip libgomp1 libcurl4 ca-certificates
+sh Install.sh --model qwen3-0.6b
+./Start-Chat.sh
+```
+
+`Install.sh` создаёт `.venv`, устанавливает клиентские зависимости, сервер и модель, записывает конфигурацию и делает скрипты запуска исполняемыми. Повторная установка продолжает скачивание. По умолчанию Linux использует **CPU**, поэтому GPU для запуска не требуется. Установка не выполняет системные команды от root. Выбор ускорения до установки модели:
+
+```sh
+# Vulkan: предварительно установите Vulkan loader и драйвер своей видеокарты.
+LLMOPENCHAT_RUNTIME_BACKEND=vulkan sh Install.sh --model qwen3-0.6b
+# NVIDIA: требуется драйвер, совместимый с выбранной версией CUDA.
+LLMOPENCHAT_RUNTIME_BACKEND=cuda sh Install.sh --model qwen3-0.6b
+```
+
+Значения `LLMOPENCHAT_RUNTIME_BACKEND`: `cpu`, `vulkan`, `cuda`, `cuda13`. На x86_64 `cuda` выбирает CUDA 12.8, `cuda13` — CUDA 13.4; на ARM64 оба варианта используют CUDA 13.4. CUDA runtime скачивается вместе с сервером; драйвер устанавливается отдельно. Выбранный исполняемый файл сохраняется в `config.json`, поэтому при обычном запуске повторять переменную не нужно. Ошибки недостающих системных библиотек и драйверов видны в `.local/logs/server.log`.
+
+Для внешнего API достаточно `sh Install.sh --client-only`: затем создайте `config.json` с `backend: "external"`, адресом и ID модели, как в разделе ниже. Ключ передаётся через `export LLMOPENCHAT_API_KEY='YOUR_API_KEY'`. Во всех примерах Windows ниже на Linux заменяйте `.\.venv\Scripts\python.exe` на `.venv/bin/python`, а пути — на Linux-пути. Все команды доступны также через скрипт:
+
+```sh
+./Start-Chat.sh doctor
+./Start-Chat.sh ask "Привет"
+./Start-Chat.sh rag add /srv/documents
+./Start-Chat.sh chat --rag
+./Start-Chat.sh scenario validate examples/scenarios/news/scenario.json
+./Start-Telegram.sh
+./Start-Telegram.sh --config profiles/bot.json --no-autostart
+```
+
+Интерактивный чат работает через SSH с терминалом; для фонового запуска используйте Telegram или `scenario serve`. В терминалах с программным управлением потоком Ctrl+S/Ctrl+Q могут перехватываться терминалом: выполните `stty -ixon` перед запуском или используйте `/save` и `/quit`.
+
+Ограниченный PowerShell требует **PowerShell 7 (`pwsh`)**, установленный системным пакетом по [инструкции Microsoft](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux), и `prlimit` из `util-linux`. Поддерживаются `/usr/bin/pwsh` и `/usr/local/bin/pwsh`; программа и её каталоги должны принадлежать root и быть недоступны для записи другим пользователям. Запускайте клиент от обычного пользователя: Linux не применяет лимит числа процессов к root. Как и в Windows, PowerShell выполняет только разрешённые вычисления и вывод в ограниченном runspace, после отдельного подтверждения. Для работы с файлами используйте файловые инструменты.
+
+Для дообучения создайте отдельное Linux-окружение; установите подходящий PyTorch и `requirements-training.txt`. Для GPU нужны совместимые PyTorch/CUDA и оборудование. Команды клиента:
+
+```sh
+python3 -m venv .venv-sft
+# После установки подходящего PyTorch:
+.venv-sft/bin/python -m pip install -r requirements-training.txt
+.venv/bin/python -m llmopenchat sft check --python .venv-sft/bin/python
+.venv/bin/python -m llmopenchat sft train .local/sft/job/job.json --python .venv-sft/bin/python
+```
+
+### Фоновая служба на Linux
+
+В [deploy/llmopenchat-telegram.service](deploy/llmopenchat-telegram.service) находится пример systemd для проекта в `/opt/llmopenchat`. Установите проект и модель в этом каталоге, создайте `config.json`, `credits.txt`, `whitelist.txt`, затем назначьте каталог отдельному пользователю службы. Пример после подготовки проекта:
+
+```sh
+sudo useradd --system --home-dir /opt/llmopenchat --shell /usr/sbin/nologin llmopenchat
+sudo chown -R llmopenchat:llmopenchat /opt/llmopenchat
+sudo chmod 600 /opt/llmopenchat/credits.txt /opt/llmopenchat/whitelist.txt
+sudo cp /opt/llmopenchat/deploy/llmopenchat-telegram.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now llmopenchat-telegram
+sudo journalctl -u llmopenchat-telegram -f
+```
+
+При другом каталоге или пользователе измените `WorkingDirectory`, `ExecStart`, `User` и `Group` в службе. Для GPU предоставьте пользователю службы доступ к устройствам драйвера; для `/dev/dri` обычно требуется членство в группах `render`/`video` вашего дистрибутива. Не предоставляйте посторонним процессам запись от имени пользователя службы: на Linux дескрипторы и проверки inode защищают файловые операции от подмены путей, но POSIX не запрещает другому процессу того же пользователя переименовывать файлы. Для переменных окружения можно создать `/etc/default/llmopenchat` с правами `600` и строками `ИМЯ=значение`; служба читает его при запуске.
+
+Остановка через `systemctl stop llmopenchat-telegram` обрабатывается через SIGTERM: клиент закрывает бота и собственный сервер. При аварийном завершении Linux-клиента управляемый сервер и его дочерние процессы также завершаются; уже работавший внешний сервер остаётся под управлением его владельца. Для вебхука используйте отдельную копию службы с командой `.venv/bin/python -m llmopenchat --config ... scenario serve ПУТЬ` и задайте `LLMOPENCHAT_WEBHOOK_TOKEN` в окружении.
 
 ## Быстрый запуск в Windows
 
@@ -96,7 +164,7 @@ $env:LLMOPENCHAT_API_KEY = "YOUR_API_KEY"
 | `server.*` | Исполняемый файл, GGUF, размер контекста и параметры локального сервера |
 | `rag.*` | Размер фрагментов и объём найденного контекста |
 
-Поля, отсутствующие в конфигурации, дополняются значениями из `llmopenchat/config.py`. Объект `request_extra` заменяется целиком. Относительные пути сервера считаются от каталога проекта. После ручного изменения настроек перезапустите клиент.
+Поля, отсутствующие в конфигурации, дополняются значениями из `llmopenchat/config.py`; путь к серверу по умолчанию выбирается для текущей платформы. Установщик записывает фактический путь к выбранной сборке. Объект `request_extra` заменяется целиком. Относительные пути сервера считаются от каталога проекта. После ручного изменения настроек перезапустите клиент.
 
 Внутри чата `/help` показывает все команды. `F1` — справка, `F2` — главное меню, `F3` — инструменты, `Alt+Enter` — новая строка, `Ctrl+C` — отмена, `Ctrl+Q` — выход. `/save`, `/load` и `/history` управляют диалогами; `/thinking`, `/system` и `/clear` меняют состояние чата.
 
@@ -180,6 +248,8 @@ $env:LLMOPENCHAT_API_KEY = "YOUR_API_KEY"
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+На Linux: `.venv/bin/python -m unittest discover -s tests -v`. В GitHub Actions предусмотрена матрица Ubuntu/Windows и Python 3.10/3.12; Linux-проверки включают файловые инструменты, подмену путей, завершение процессов и PowerShell при наличии системного `pwsh` и `prlimit`.
 
 ## Лицензии
 

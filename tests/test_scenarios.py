@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -419,6 +421,66 @@ class HostPolicyTests(unittest.TestCase):
         self.load("https://news.example")
         with self.path.open("ab"), self.assertRaises(ScenarioError):
             load_hosts(self.path)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux policy descriptor access")
+class LinuxHostPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="llmopenchat-policy-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def test_symlink_ancestor_is_rejected_before_content_read(self):
+        from llmopenchat._posixfiles import LockedHandle as LinuxHandle
+
+        directory = self.root / "real" / "nested"
+        directory.mkdir(parents=True)
+        (directory / "hosts.txt").write_text("https://news.example\n", encoding="utf-8")
+        alias = self.root / "alias"
+        alias.symlink_to(directory.parent, target_is_directory=True)
+        with patch.object(LinuxHandle, "read") as read, self.assertRaises(ScenarioError):
+            load_hosts(alias / "nested" / "hosts.txt")
+        read.assert_not_called()
+
+    def test_relative_policy_path_keeps_normal_origin_loading(self):
+        path = self.root / "hosts.txt"
+        path.write_text("https://news.example\n", encoding="utf-8")
+        relative = Path(os.path.relpath(path, Path.cwd()))
+        policy = load_hosts(relative)
+        self.assertEqual(policy.path, relative.absolute())
+        self.assertTrue(policy.allows("https://news.example/article"))
+
+    def test_regular_file_raced_into_fifo_is_rejected_without_hanging(self):
+        path = self.root / "hosts.txt"
+        path.write_text("https://news.example\n", encoding="utf-8")
+        # Keep a regression from hanging the entire suite if a blocking open is
+        # accidentally reintroduced between metadata validation and opening.
+        script = r'''
+import os, sys
+from pathlib import Path
+from unittest.mock import patch
+from llmopenchat.scenarios import ScenarioError, load_hosts
+path = Path(sys.argv[1])
+original = Path.lstat
+raced = False
+def lstat(current, *args, **kwargs):
+    global raced
+    info = original(current, *args, **kwargs)
+    if current == path and not raced:
+        raced = True
+        path.unlink()
+        os.mkfifo(path)
+    return info
+try:
+    with patch.object(Path, 'lstat', new=lstat):
+        load_hosts(path)
+except ScenarioError:
+    sys.exit(0)
+raise AssertionError('FIFO policy was accepted')
+'''
+        completed = subprocess.run([sys.executable, "-c", script, str(path)],
+                                   capture_output=True, text=True, timeout=5)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

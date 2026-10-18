@@ -12,10 +12,11 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+from contextlib import ExitStack
 
 from llmopenchat import harness
-from llmopenchat._winfiles import LockedHandle, supported
-from llmopenchat import _winfiles
+from llmopenchat._files import LockedHandle, supported
+from llmopenchat import _files, _posixfiles, _winfiles
 from llmopenchat.harness import HarnessError, HarnessSettings, ToolHarness
 
 
@@ -113,7 +114,7 @@ class HarnessControlTests(unittest.TestCase):
                 ToolHarness(HarnessSettings(powershell_enabled=True, repository=Path.cwd()), lambda request: True)
 
 
-@unittest.skipUnless(supported(), "Secure PowerShell file loading requires Windows native handles")
+@unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
 class PowerShellHarnessTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -182,6 +183,7 @@ class PowerShellHarnessTests(unittest.TestCase):
         self.assertEqual(result["path"], "hello.ps1")
         self.assertTrue(result["execution_started"])
 
+    @unittest.skipUnless(os.name == "nt", "Mandatory share locks are specific to Windows")
     def test_every_script_run_requires_approval_and_keeps_file_and_root_pinned(self):
         def run(source, repository, timeout):
             self.assertEqual(source, self.source)
@@ -247,6 +249,7 @@ class PowerShellHarnessTests(unittest.TestCase):
             runner.assert_not_called()
         self.approve.assert_not_called()
 
+    @unittest.skipUnless(os.name == "nt", "Junctions are specific to Windows")
     def test_junction_script_parent_is_rejected_before_approval_or_execution(self):
         outside = self.base / "outside"
         outside.mkdir()
@@ -305,6 +308,8 @@ class PowerShellHarnessTests(unittest.TestCase):
         (package / "__init__.py").write_bytes(b"")
         (package / "harness.py").write_bytes(Path(harness.__file__).read_bytes())
         (package / "_winfiles.py").write_bytes(Path(_winfiles.__file__).read_bytes())
+        (package / "_files.py").write_bytes(Path(_files.__file__).read_bytes())
+        (package / "_posixfiles.py").write_bytes(Path(_posixfiles.__file__).read_bytes())
         trusted_source = (
             f"AVAILABLE_CMDLETS = {harness._POWERSHELL_CMDLETS!r}\n"
             "class PowerShellError(RuntimeError):\n    started = False\n"
@@ -334,7 +339,7 @@ class PowerShellHarnessTests(unittest.TestCase):
                 del sys.modules[name]
 
 
-@unittest.skipUnless(supported(), "Secure file tooling requires Windows native handles")
+@unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
 class RepositoryHarnessTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -358,7 +363,9 @@ class RepositoryHarnessTests(unittest.TestCase):
             ToolHarness(HarnessSettings(code_enabled=True), lambda request: True)
 
     def test_unsafe_paths_are_rejected_before_approval(self):
-        forbidden = ["../outside", "a/../../outside", "./a", "/outside", r"C:\outside", "C:relative", r"\\server\share\file", r"\\?\C:\outside", "file:ads", ".git/config", "a/.GiT/config", "NUL", "nul.txt", "CONIN$", "CONOUT$", "CLOCK$", "COM¹.txt", "LPT²", "a.", "a ", "a//b", "a~1", "a\x00b", "a\x1bb", "a\u202eb"]
+        forbidden = ["../outside", "a/../../outside", "./a", "/outside", r"C:\outside", "C:relative", r"\\server\share\file", r"\\?\C:\outside", ".git/config", "a/.GiT/config", "a//b", "a\x00b", "a\x1bb", "a\u202eb"]
+        if os.name == "nt":
+            forbidden += ["file:ads", "NUL", "nul.txt", "CONIN$", "CONOUT$", "CLOCK$", "COM¹.txt", "LPT²", "a.", "a ", "a~1"]
         for path in forbidden:
             with self.subTest(path=path):
                 self.assertEqual(call(self.tools, "write_file", path=path, content="bad")["status"], "error")
@@ -378,7 +385,11 @@ class RepositoryHarnessTests(unittest.TestCase):
         target = self.repository / "existing.txt"
         target.write_text("secret", encoding="utf-8")
         self.deny()
-        with patch.object(LockedHandle, "read") as read, patch.object(LockedHandle, "write") as write, patch.object(harness.os, "scandir") as scan, patch.object(_winfiles._kernel, "CreateDirectoryW") as mkdir:
+        with ExitStack() as stack:
+            read = stack.enter_context(patch.object(LockedHandle, "read"))
+            write = stack.enter_context(patch.object(LockedHandle, "write"))
+            scan = stack.enter_context(patch.object(harness.os, "scandir"))
+            mkdir = stack.enter_context(patch.object(_winfiles._kernel, "CreateDirectoryW") if os.name == "nt" else patch.object(os, "mkdir"))
             for name, arguments in [("read_file", {"path": "existing.txt"}), ("write_file", {"path": "existing.txt", "content": "replacement"}), ("write_file", {"path": "new.txt", "content": "new"}), ("write_file", {"path": "new-project/src/Program.cs", "content": "new"}), ("create_directory", {"path": "new-directory/nested"}), ("list_files", {}), ("search_files", {"query": "secret"})]:
                 self.assertEqual(call(self.tools, name, **arguments)["status"], "denied")
             read.assert_not_called()
@@ -452,6 +463,7 @@ class RepositoryHarnessTests(unittest.TestCase):
         self.assertTrue((self.repository / "projects" / "HelloWorld" / "HelloWorld.csproj").is_file())
         self.assertEqual(len(self.approvals), 2)
 
+    @unittest.skipUnless(os.name == "nt", "Mandatory share locks are specific to Windows")
     def test_existing_parent_prefix_stays_pinned_when_missing_children_are_approved(self):
         (self.repository / "existing").mkdir()
 
@@ -569,6 +581,7 @@ class RepositoryHarnessTests(unittest.TestCase):
         self.assertEqual(call(self.tools, "list_files")["status"], "error")
         self.assertEqual(self.approvals, [])
 
+    @unittest.skipUnless(os.name == "nt", "Mandatory share locks are specific to Windows")
     def test_repo_ancestors_and_existing_target_cannot_be_swapped_during_approval(self):
         target = self.repository / "existing.txt"
         target.write_text("original", encoding="utf-8")
@@ -607,6 +620,7 @@ class RepositoryHarnessTests(unittest.TestCase):
         self.assertEqual(call(self.tools, "write_file", path="new.txt", content="bad")["status"], "error")
         self.assertEqual(outside.read_text(encoding="utf-8"), "secret")
 
+    @unittest.skipUnless(os.name == "nt", "Mandatory share locks are specific to Windows")
     def test_locked_target_cannot_gain_outside_hardlink_during_approval(self):
         target = self.repository / "existing.txt"
         target.write_text("original", encoding="utf-8")
@@ -623,6 +637,7 @@ class RepositoryHarnessTests(unittest.TestCase):
         self.assertFalse(outside_alias.exists())
         self.assertEqual(target.read_text(encoding="utf-8"), "new")
 
+    @unittest.skipUnless(os.name == "nt", "Mandatory share locks are specific to Windows")
     def test_preexisting_write_capable_directory_handle_rejects_root_lock(self):
         from llmopenchat import _winfiles
         kernel = _winfiles._kernel
@@ -660,6 +675,7 @@ class RepositoryHarnessTests(unittest.TestCase):
         if completed.returncode:
             self.skipTest("Junction creation unavailable: " + completed.stderr)
 
+    @unittest.skipUnless(os.name == "nt", "Junctions are specific to Windows")
     def test_junctions_in_target_root_and_root_ancestors_are_blocked(self):
         outside = self.base / "outside"
         outside.mkdir()
@@ -681,6 +697,7 @@ class RepositoryHarnessTests(unittest.TestCase):
         finally:
             link.rmdir()
 
+    @unittest.skipUnless(os.name == "nt", "Junctions are specific to Windows")
     def test_junction_racing_in_missing_parent_cannot_receive_new_children(self):
         outside = self.base / "outside"
         outside.mkdir()
@@ -699,6 +716,7 @@ class RepositoryHarnessTests(unittest.TestCase):
                 if link.exists():
                     link.rmdir()
 
+    @unittest.skipUnless(os.name == "nt", "Junctions are specific to Windows")
     def test_created_directory_replaced_by_junction_before_pin_fails_closed(self):
         outside = self.base / "outside"
         outside.mkdir()
@@ -889,7 +907,7 @@ class PublicRequestTests(unittest.TestCase):
                 self.request(FakeResponse(), url="https://example.com/", tls_context=context)
 
 
-@unittest.skipUnless(supported(), "Repository policy protection requires Windows native handles")
+@unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
 class HostsPolicyProtectionTests(unittest.TestCase):
     def test_policy_writes_are_rejected_before_approval_and_cannot_disable_guard(self):
         with tempfile.TemporaryDirectory() as directory:

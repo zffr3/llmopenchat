@@ -2,8 +2,8 @@
 
 Settings are owned by the CLI, never exposed as a model tool. Every invocation
 gets a fresh approval, including listing, searching, and reading. Code tools use
-Windows native handles; unsupported platforms fail closed rather than weakening
-the repository boundary. Web requests use direct, pinned public-IP sockets.
+native Windows handles or Linux no-follow directory descriptors. Unsupported
+platforms fail closed. Web requests use direct, pinned public-IP sockets.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit, urlunsplit
 
-from ._winfiles import FileAccessError, LockedHandle, LockedRepository, supported
+from ._files import FileAccessError, LockedHandle, LockedRepository, supported
 from .powershell import AVAILABLE_CMDLETS as _POWERSHELL_CMDLETS, PowerShellError, run_powershell
 
 
@@ -80,8 +80,12 @@ _BIDI = re.compile(r"[\u202a-\u202e\u2066-\u2069]")
 def _component(part: str):
     if (
         not part or part in (".", "..") or len(part) > 255
-        or part.endswith((".", " ")) or _FORBIDDEN.search(part) or _BIDI.search(part)
-        or part.casefold() == ".git" or part.split(".", 1)[0].casefold() in _DOS_NAMES
+        or re.search(r'[\x00-\x1f\x7f-\x9f]', part) or _BIDI.search(part)
+        or part.casefold() == ".git"
+        or (os.name == "nt" and (
+            part.endswith((".", " ")) or _FORBIDDEN.search(part)
+            or part.split(".", 1)[0].casefold() in _DOS_NAMES
+        ))
     ):
         raise HarnessError("Недопустимый путь: ссылки, .git, traversal, ADS и имена устройств запрещены.")
 
@@ -92,7 +96,7 @@ def _relative(value: str, *, directory: bool = False) -> tuple[str, ...]:
     if directory and value in ("", "."):
         return ()
     normalized = value.replace("\\", "/")
-    if normalized.startswith("/"):
+    if normalized.startswith("/") or re.match(r"^[a-zA-Z]:", normalized):
         raise HarnessError("Абсолютные, UNC и device пути запрещены.")
     parts = tuple(normalized.split("/"))
     for part in parts:
@@ -104,13 +108,15 @@ def _relative(value: str, *, directory: bool = False) -> tuple[str, ...]:
 
 def _repository_path(value: Path | None) -> Path:
     if not supported():
-        raise HarnessError("Строгий файловый доступ поддерживается только в Windows; инструменты репозитория отключены.")
+        raise HarnessError("Строгий файловый доступ поддерживается в Windows и Linux; инструменты репозитория отключены.")
     if value is None:
         raise HarnessError("Сначала выберите существующую папку репозитория в меню инструментов.")
     path = Path(value)
     raw = str(path)
-    if not path.is_absolute() or raw.startswith(("\\\\", "//")) or len(path.anchor) != 3:
+    if os.name == "nt" and (not path.is_absolute() or raw.startswith(("\\\\", "//")) or len(path.anchor) != 3):
         raise HarnessError("Репозиторий должен быть абсолютной папкой на локальном диске Windows.")
+    if os.name != "nt" and (not path.is_absolute() or raw.startswith("//")):
+        raise HarnessError("Репозиторий должен быть существующей абсолютной папкой Linux без символических ссылок.")
     for part in path.parts[1:]:
         _component(part)
     # No resolve(): it would follow precisely the links this boundary prohibits.
@@ -546,7 +552,6 @@ class ToolHarness:
                             "/".join(directory_parts[:index + 1]) for index in range(existing_count, len(directory_parts))
                         )
                     if name in {"read_file", "write_file", "powershell_run"}:
-                        target = locked.root.joinpath(*parts)
                         if name in {"read_file", "powershell_run"}:
                             locked.directory(parts[:-1])
                         # No target can preexist while an ancestor is missing.
@@ -554,17 +559,13 @@ class ToolHarness:
                         # process supplies parents during the approval prompt.
                         exists = False
                         if not directories_to_create:
-                            try:
-                                os.lstat(target)
-                                exists = True
-                            except FileNotFoundError:
-                                pass
+                            exists = locked.exists(parts)
                         if name == "write_file" and not exists:
                             # Missing targets are created with CREATE_NEW only
                             # after consent; a racing new file cannot be replaced.
                             new_file = True
                         else:
-                            file = stack.enter_context(LockedHandle(target, write=name == "write_file"))
+                            file = stack.enter_context(locked.open_file(parts, write=name == "write_file"))
                             if name == "powershell_run" and file.size > MAX_FILE_BYTES:
                                 raise HarnessError(f"PowerShell-скрипт превышает лимит {MAX_FILE_BYTES} байт.")
                     elif name != "create_directory":
@@ -584,13 +585,15 @@ class ToolHarness:
                     if name == "powershell_run":
                         result.update({"restricted": True, "available_cmdlets": list(_POWERSHELL_CMDLETS), "execution_started": False})
                     return json.dumps(result, ensure_ascii=False)
+                if locked is not None:
+                    locked.validate()
                 status = "ok"
                 if name == "read_file":
                     result = {"path": values["path"], "content": file.read(MAX_FILE_BYTES).decode("utf-8")}
                 elif name == "write_file":
                     created_directories = locked.create_directories(directory_parts, existing_count)
                     if new_file:
-                        file = stack.enter_context(LockedHandle(target, write=True, create=True))
+                        file = stack.enter_context(locked.open_file(parts, write=True, create=True))
                     content = values["content"].encode("utf-8")
                     file.write(content)
                     result = {"path": values["path"], "bytes_written": len(content), "created": new_file, "directories_created": created_directories}
@@ -623,7 +626,6 @@ class ToolHarness:
 
     def _scan(self, locked: LockedRepository, values: dict, *, search: bool) -> dict:
         start_parts = _relative(values["path"], directory=True)
-        root = locked.root
         results: list[dict] = []
         visited = 0
         bytes_read = 0
@@ -637,8 +639,7 @@ class ToolHarness:
             if len(parts) > MAX_DEPTH:
                 truncated = True
                 return
-            path = root.joinpath(*parts)
-            with os.scandir(path) as entries:
+            with locked.scandir(parts) as entries:
                 for entry in entries:
                     if visited >= MAX_FILES or len(results) >= values["max_results"] or bytes_read >= MAX_SEARCH_BYTES:
                         truncated = True
@@ -653,17 +654,17 @@ class ToolHarness:
                     relative = "/".join(target_parts)
                     try:
                         metadata = entry.stat(follow_symlinks=False)
-                        if getattr(metadata, "st_file_attributes", 0) & 0x400 or metadata.st_nlink > 1:
+                        if getattr(metadata, "st_file_attributes", 0) & 0x400 or (entry.is_file(follow_symlinks=False) and metadata.st_nlink > 1):
                             skipped += 1
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            with LockedHandle(Path(entry.path), directory=True):
+                            with locked.open_directory(target_parts):
                                 if not search:
                                     results.append({"path": relative, "type": "directory"})
                                 if search or values.get("recursive"):
                                     walk(target_parts)
                         elif entry.is_file(follow_symlinks=False):
-                            with LockedHandle(Path(entry.path)) as handle:
+                            with locked.open_file(target_parts) as handle:
                                 if not search:
                                     results.append({"path": relative, "type": "file", "bytes": handle.size})
                                     continue

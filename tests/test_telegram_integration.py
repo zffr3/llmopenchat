@@ -16,6 +16,7 @@ from unittest.mock import patch
 from llmopenchat.config import DEFAULT_CONFIG
 from llmopenchat.history import load_session
 from llmopenchat.telegram import BotRuntime, TelegramBot
+from llmopenchat._files import supported
 
 
 class FakeTelegramAPI:
@@ -69,7 +70,7 @@ class FakeTelegramAPI:
         return {"message_id": message_id}
 
 
-@unittest.skipUnless(os.name == "nt", "Strict repository tools require Windows handles")
+@unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
 class TelegramIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="llmopenchat-telegram-http-")

@@ -228,3 +228,8 @@ models/
 config.json
 credits.txt
 whitelist.txt
+
+# Local coding-agent state and personal instruction overrides
+/.codex/
+/.agents/
+/AGENTS.override.md

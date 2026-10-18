@@ -1,4 +1,4 @@
-"""Real HTTP/SSE through the human menu into the Windows repository boundary."""
+"""Real HTTP/SSE through the human menu into the native repository boundary."""
 
 from __future__ import annotations
 
@@ -18,9 +18,11 @@ from rich.console import Console
 from llmopenchat import cli
 from llmopenchat.config import DEFAULT_CONFIG
 from llmopenchat.history import load_session
+from llmopenchat._files import supported
+from llmopenchat.powershell import availability_error
 
 
-@unittest.skipUnless(os.name == "nt", "Strict repository tools require Windows handles")
+@unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
 class ToolsIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="llmopenchat-tools-http-")
@@ -126,6 +128,7 @@ class ToolsIntegrationTests(unittest.TestCase):
         self.assertIn("отклонён", output)
         self.assert_round("denied")
 
+    @unittest.skipUnless(availability_error() is None, "A trusted, restricted PowerShell runtime is required")
     def test_written_powershell_script_needs_second_approval_and_runs_restricted(self):
         self.run_script = True
         self.target = "project/hello.ps1"

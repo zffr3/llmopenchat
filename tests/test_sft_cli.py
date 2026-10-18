@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -71,10 +72,14 @@ class SftCliTests(unittest.TestCase):
         process.wait.return_value = 0
         output = []
         with (patch.object(sft_cli.subprocess, "Popen", return_value=process) as popen,
-              patch.object(sft_cli, "_WindowsJob") as guard):
+              patch.object(sft_cli, "_WindowsJob") as guard,
+              patch.object(os, "killpg", create=True)):
             self.assertEqual(sft_cli.launch_training(self.root, job=job,
                                                      python=Path("env folder/python.exe"), emit=output.append), 0)
         argv = popen.call_args.args[0]
+        if sft_cli.sys.platform.startswith("linux"):
+            self.assertEqual(argv[:3], [sft_cli.sys.executable, "-I", "-c"])
+            argv = argv[5:]
         self.assertEqual(argv[0], str(self.root / "env folder/python.exe"))
         self.assertEqual(argv[-1], str(job))
         self.assertNotIn("shell", popen.call_args.kwargs)
@@ -89,9 +94,13 @@ class SftCliTests(unittest.TestCase):
         process.stdout.__iter__.side_effect = KeyboardInterrupt
         process.poll.return_value = 130
         with (patch.object(sft_cli.subprocess, "Popen", return_value=process),
-              patch.object(sft_cli, "_WindowsJob") as guard):
+              patch.object(sft_cli, "_WindowsJob") as guard,
+              patch.object(os, "killpg", create=True) as killpg):
             self.assertEqual(sft_cli.launch_training(self.root, emit=lambda text: None), 130)
-        process.send_signal.assert_called_once()
+        if os.name == "nt":
+            process.send_signal.assert_called_once()
+        else:
+            killpg.assert_any_call(process.pid, sft_cli.signal.SIGINT)
         process.stdout.close.assert_called_once()
         if sft_cli.os.name == "nt":
             guard.return_value.close.assert_called_once()

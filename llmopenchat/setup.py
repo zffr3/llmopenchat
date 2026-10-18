@@ -1,4 +1,4 @@
-"""Install a pinned official llama.cpp Vulkan runtime and one GGUF model."""
+"""Install a pinned official llama.cpp runtime and one GGUF model."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import platform
 import re
 import shutil
 import stat
+import tarfile
 import time
 from typing import Callable
 import urllib.error
@@ -33,10 +34,48 @@ _ASSETS = (
         "sha256": "975a788f5e5a55410fb5b72660f3f5673ad9fccbe99d66a2a2034f775a0bd432",
     },
 )
+# Published sizes and SHA256 digests from the b11445 GitHub release API.
+_LINUX_ASSETS = {
+    ("cpu", "x64"): ("llama-b11445-bin-ubuntu-x64.tar.gz", 17692925, "9895c1de3a7dd734ae4ed143041b7b6a7e5033a7d2c40f262bf50925cc14aa8b"),
+    ("cpu", "arm64"): ("llama-b11445-bin-ubuntu-arm64.tar.gz", 13682046, "bc718fc37a363d8659ff0e040e1e0cf3f4db01b3bc14b734f331a533f32bebd1"),
+    ("vulkan", "x64"): ("llama-b11445-bin-ubuntu-vulkan-x64.tar.gz", 31637791, "dd98daa1df6ae680e69a0b5e27789b00d90715e712d007bd14c2c35d3841faf6"),
+    ("vulkan", "arm64"): ("llama-b11445-bin-ubuntu-vulkan-arm64.tar.gz", 24844937, "195d4e301d9fb0e8a09702ac4ee753c774e1e84805791a6fd479e6686eb8d80e"),
+    ("cuda", "x64"): ("llama-b11445-bin-ubuntu-cuda-12.8-x64.tar.gz", 171643444, "b8005fd35d216a46bb8b7e6a39f1c59fc64dc79d8c9990933274b926b84e42a3"),
+    ("cuda", "arm64"): ("llama-b11445-bin-ubuntu-cuda-13.4-arm64.tar.gz", 147608325, "4f28b621deed48e7085794948a64b7cb13b7441f9f96487d8af494d872863aea"),
+    ("cuda13", "x64"): ("llama-b11445-bin-ubuntu-cuda-13.4-x64.tar.gz", 152483389, "d0a341bf8147513eab85d0bfbf5b4d2b51e293f05aa7b106fcc6047e308ae064"),
+}
+_CUDA_ASSETS = {
+    ("cuda", "x64"): ("cudart-llama-b11445-bin-ubuntu-cuda-12.8-x64.tar.gz", 594377578, "3712a43f753259a74455f22b5ddae3e5d2fa26d7f2993537fc726cce58e4c585"),
+    ("cuda", "arm64"): ("cudart-llama-b11445-bin-ubuntu-cuda-13.4-arm64.tar.gz", 552521396, "561dd7d4c139f621527210689fcb91050902e894ac1c7069d1ce93ec8b588ace"),
+    ("cuda13", "x64"): ("cudart-llama-b11445-bin-ubuntu-cuda-13.4-x64.tar.gz", 440236531, "2e73927195785f0767a848a9a3dfe5610d8a07923432e77dd1bd3792f17b0f44"),
+}
 
 
 class SetupError(RuntimeError):
     """An actionable local installation error."""
+
+
+def _runtime_spec() -> dict:
+    """Select a verified bundle without guessing the server's GPU or driver."""
+    machine = platform.machine().lower()
+    architecture = {"amd64": "x64", "x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    if os.name == "nt" and architecture == "x64":
+        return {"platform": "windows", "architecture": "x64", "backend": "vulkan", "assets": _ASSETS,
+                "directory": f"llama-{LLAMA_RELEASE}-vulkan", "executable": "llama-server.exe"}
+    if os.name != "posix" or platform.system() != "Linux" or architecture is None:
+        raise SetupError("Автоустановка поддерживает Windows x64 и Linux x86_64/ARM64. Для другой платформы укажите свой llama-server или внешний API.")
+    backend = os.environ.get("LLMOPENCHAT_RUNTIME_BACKEND", "cpu").strip().lower()
+    if backend == "cuda13" and architecture == "arm64":
+        backend = "cuda"
+    key = (backend, architecture)
+    if key not in _LINUX_ASSETS:
+        raise SetupError("LLMOPENCHAT_RUNTIME_BACKEND: используйте cpu, vulkan, cuda или cuda13 на Linux.")
+    bundles = [_LINUX_ASSETS[key]]
+    if key in _CUDA_ASSETS:
+        bundles.append(_CUDA_ASSETS[key])
+    assets = tuple({"name": name, "size": size, "sha256": digest} for name, size, digest in bundles)
+    return {"platform": "linux", "architecture": architecture, "backend": backend, "assets": assets,
+            "directory": f"llama-{LLAMA_RELEASE}-linux-{architecture}-{backend}", "executable": "llama-server"}
 
 
 def _sha256(path: Path) -> str:
@@ -112,7 +151,10 @@ def _download_asset(asset: dict, destination: Path, emit: Callable[[str], None])
 
 
 def _extract_archive(archive: Path, target: Path) -> None:
-    """Reject traversal and symlinks even for the pinned official release assets."""
+    """Extract regular files only, materializing safe in-archive tar links."""
+    if archive.name.endswith((".tar.gz", ".tgz")):
+        _extract_tar(archive, target)
+        return
     with zipfile.ZipFile(archive) as compressed:
         for member in compressed.infolist():
             portable = PurePosixPath(member.filename.replace("\\", "/"))
@@ -129,38 +171,94 @@ def _extract_archive(archive: Path, target: Path) -> None:
                 shutil.copyfileobj(source, sink, length=4 * 1024 * 1024)
 
 
+def _extract_tar(archive: Path, target: Path) -> None:
+    # Do not use extractall: links and special files must never touch the host.
+    with tarfile.open(archive, "r:gz") as compressed:
+        members = {}
+        for member in compressed.getmembers():
+            portable = PurePosixPath(member.name.replace("\\", "/"))
+            if portable.is_absolute() or ".." in portable.parts or any(":" in part for part in portable.parts):
+                raise SetupError(f"Недопустимый путь внутри архива: {member.name}")
+            _inside(target, target.joinpath(*portable.parts))
+            if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+                raise SetupError(f"Специальный файл внутри архива: {member.name}")
+            key = portable.as_posix()
+            if key in members:
+                raise SetupError(f"Повторный путь внутри архива: {member.name}")
+            members[key] = member
+
+        def regular(member, seen):
+            if member.isfile():
+                return member
+            if member.name in seen:
+                raise SetupError(f"Циклическая ссылка внутри архива: {member.name}")
+            link = PurePosixPath(member.linkname.replace("\\", "/"))
+            if link.is_absolute() or any(":" in part for part in link.parts):
+                raise SetupError(f"Недопустимая ссылка внутри архива: {member.name}")
+            base = PurePosixPath(member.name).parent if member.issym() else PurePosixPath()
+            resolved = _inside(target, target.joinpath(*(base / link).parts)).relative_to(target.resolve()).as_posix()
+            destination = members.get(resolved)
+            if destination is None or destination.isdir():
+                raise SetupError(f"Ссылка не указывает на файл архива: {member.name}")
+            return regular(destination, seen | {member.name})
+
+        # Validate every link before creating files. Copy targets as ordinary
+        # files so shared-library aliases also work on hosts without symlinks.
+        sources = {key: regular(member, set()) for key, member in members.items() if not member.isdir()}
+        for key, member in members.items():
+            output = _inside(target, target / key)
+            if member.isdir():
+                output.mkdir(parents=True, exist_ok=True)
+                continue
+            source_member = sources[key]
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with compressed.extractfile(source_member) as source, output.open("wb") as sink:
+                shutil.copyfileobj(source, sink, length=4 * 1024 * 1024)
+            output.chmod((source_member.mode & 0o755) | 0o600)
+
+
 def _install_runtime(root: Path, emit: Callable[[str], None]) -> Path:
-    runtime = _inside(root, root / ".local" / "runtime" / f"llama-{LLAMA_RELEASE}-{LLAMA_BACKEND}")
+    spec = _runtime_spec()
+    assets = spec["assets"]
+    runtime = _inside(root, root / ".local" / "runtime" / spec["directory"])
     marker = runtime / "installation.json"
     if marker.is_file():
         try:
             recorded = json.loads(marker.read_text(encoding="utf-8"))
             executable = _inside(runtime, runtime / recorded["executable"])
-            if recorded["release"] == LLAMA_RELEASE and recorded["assets"] == list(_ASSETS) and executable.is_file():
+            if recorded["release"] == LLAMA_RELEASE and recorded["assets"] == list(assets) and executable.is_file():
+                if spec["platform"] == "linux":
+                    executable.chmod(executable.stat().st_mode | 0o111)
                 return executable
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, TypeError):
             pass
         raise SetupError(f"Неполная установка среды {runtime}. Переименуйте этот каталог и повторите установку.")
     if runtime.exists():
         raise SetupError(f"Каталог {runtime} уже существует без метаданных установки. Переименуйте его и повторите.")
     downloads = _inside(root, root / ".local" / "downloads")
     archives = []
-    for asset in _ASSETS:
+    for asset in assets:
         archive = downloads / asset["name"]
         _download_asset(asset, archive, emit)
         archives.append(archive)
     staging = _inside(root, root / ".local" / "runtime" / f"staging-{uuid.uuid4().hex}")
     staging.mkdir(parents=True)
     try:
-        emit(f"Установка официального llama.cpp {LLAMA_RELEASE} / Vulkan…")
+        emit(f"Установка официального llama.cpp {LLAMA_RELEASE} / {spec['platform']} / {spec['backend']}…")
         for archive in archives:
             _extract_archive(archive, staging)
-        executables = list(staging.rglob("llama-server.exe"))
+        executables = list(staging.rglob(spec["executable"]))
         if len(executables) != 1:
-            raise SetupError("В архиве не найден единственный llama-server.exe.")
+            raise SetupError(f"В архиве не найден единственный {spec['executable']}.")
         executable = executables[0]
+        if spec["platform"] == "linux" and executable.parent != staging:
+            shutil.copy2(executable, staging / "llama-server")
+            executable = staging / "llama-server"
         # Release dependency archives may put DLLs in a separate subdirectory.
-        for dll in list(staging.rglob("*.dll")):
+        libraries = "*.dll" if spec["platform"] == "windows" else "*.so*"
+        for dll in list(staging.rglob(libraries)):
+            if not dll.is_file():
+                continue
             sibling = executable.parent / dll.name
             if sibling == dll:
                 continue
@@ -168,14 +266,19 @@ def _install_runtime(root: Path, emit: Callable[[str], None]) -> Path:
                 raise SetupError(f"Конфликт зависимостей среды: {dll.name}")
             if not sibling.exists():
                 shutil.copy2(dll, sibling)
-        dll_names = {dll.name.lower() for dll in executable.parent.glob("*.dll")}
-        if "ggml-vulkan.dll" not in dll_names:
-            raise SetupError("В официальном архиве отсутствует ggml-vulkan.dll.")
+        if spec["backend"] in {"vulkan", "cuda", "cuda13"}:
+            library = "ggml-vulkan.dll" if spec["platform"] == "windows" else "libggml-" + ("vulkan" if spec["backend"] == "vulkan" else "cuda") + ".so*"
+            if not list(executable.parent.glob(library)):
+                raise SetupError(f"В официальном архиве отсутствует {library}.")
+        if spec["platform"] == "linux":
+            executable.chmod(executable.stat().st_mode | 0o111)
         recorded = {
             "release": LLAMA_RELEASE,
-            "backend": LLAMA_BACKEND,
+            "backend": spec["backend"],
+            "platform": spec["platform"],
+            "architecture": spec["architecture"],
             "source": f"https://github.com/ggml-org/llama.cpp/releases/tag/{LLAMA_RELEASE}",
-            "assets": list(_ASSETS),
+            "assets": list(assets),
             "executable": executable.relative_to(staging).as_posix(),
         }
         (staging / "installation.json").write_text(json.dumps(recorded, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -195,8 +298,7 @@ def install_local(
     emit: Callable[[str], None] = print,
 ) -> dict:
     """Download only the selected GGUF, returning workspace-relative config paths."""
-    if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
-        raise SetupError("Эта автоматическая установка рассчитана на Windows x64 с видеодрайвером Vulkan.")
+    spec = _runtime_spec()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_id):
         raise SetupError("Неверный идентификатор Hugging Face; нужен формат автор/репозиторий.")
     if Path(filename).name != filename or "/" in filename or "\\" in filename or not filename.lower().endswith(".gguf") or ":" in filename:
@@ -230,7 +332,7 @@ def install_local(
     already_downloaded = model.is_file() and model.stat().st_size == selected.size
     archive_remaining = sum(
         asset["size"]
-        for asset in _ASSETS
+        for asset in spec["assets"]
         if not (root / ".local" / "downloads" / asset["name"]).is_file()
     )
     required = (0 if already_downloaded else selected.size) + archive_remaining + 4 * _GIB
@@ -270,8 +372,8 @@ def install_local(
     lock = {
         **result,
         "runtime_release": LLAMA_RELEASE,
-        "runtime_backend": LLAMA_BACKEND,
-        "runtime_assets": list(_ASSETS),
+        "runtime_backend": spec["backend"],
+        "runtime_assets": list(spec["assets"]),
         "model": provenance,
     }
     lock_path = _inside(root, root / ".local" / "install.json")
@@ -292,8 +394,7 @@ OLLAMA_BLOB = "https://registry.ollama.ai/v2/" + OLLAMA_MODEL + "/blobs/sha256:"
 def install_ollama_local(root: Path, emit: Callable[[str], None] = print) -> dict:
     """Install the author's pinned Q4_K_M GGUF without installing Ollama."""
     from .download import download_file
-    if os.name != "nt" or platform.machine().lower() not in {"amd64", "x86_64"}:
-        raise SetupError("Эта автоматическая установка рассчитана на Windows x64 с видеодрайвером Vulkan.")
+    spec = _runtime_spec()
     root = Path(root).resolve()
     if not root.is_dir():
         raise SetupError(f"Каталог проекта не существует: {root}")
@@ -345,7 +446,7 @@ def install_ollama_local(root: Path, emit: Callable[[str], None] = print) -> dic
         "filename": OLLAMA_FILENAME,
         "chat_template_file": "llmopenchat/templates/GLM-4.7-Flash.jinja",
     }
-    lock = {**result, "runtime_release": LLAMA_RELEASE, "runtime_backend": "vulkan", "runtime_assets": list(_ASSETS), "model": provenance}
+    lock = {**result, "runtime_release": LLAMA_RELEASE, "runtime_backend": spec["backend"], "runtime_assets": list(spec["assets"]), "model": provenance}
     lock_path = _inside(root, root / ".local" / "install.json")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.write_text(json.dumps(lock, ensure_ascii=False, indent=2), encoding="utf-8")

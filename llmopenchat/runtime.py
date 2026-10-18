@@ -12,6 +12,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import BinaryIO, Callable
 from urllib.error import HTTPError, URLError
@@ -32,6 +33,58 @@ _SERVER_TOOL_ENVIRONMENT = {
     "LLAMA_ARG_AGENT", "LLAMA_ARG_NO_AGENT", "LLAMA_ARG_UI_MCP_PROXY",
     "LLAMA_ARG_NO_UI_MCP_PROXY", "LLAMA_ARG_MODELS_PRESET",
 }
+
+# A separate guardian follows the owner process, including SIGKILL. Linux's
+# PR_SET_PDEATHSIG follows the creating thread instead, which would incorrectly
+# kill models started by Telegram's short-lived model-switch worker thread.
+_LINUX_GUARD = r"""
+import os, select, signal, subprocess, sys, time
+def owner_gone():
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+signal.signal(signal.SIGTERM, lambda signum, frame: None)
+signal.signal(signal.SIGINT, lambda signum, frame: None)
+parent = int(sys.argv[1])
+if os.getppid() != parent:
+    owner_gone()
+def start_time():
+    try:
+        with open('/proc/%d/stat' % parent) as stream:
+            fields = stream.read().rsplit(')', 1)[1].split()
+            return fields[19] if fields[0] not in {'Z', 'X'} else None
+    except (OSError, IndexError):
+        return None
+identity = start_time()
+owner_fd = None
+try:
+    owner_fd = os.pidfd_open(parent)
+except (AttributeError, OSError):
+    if identity is None:
+        owner_gone()
+if os.getppid() != parent:
+    owner_gone()
+child = subprocess.Popen(sys.argv[2:])
+try:
+    while child.poll() is None:
+        if owner_fd is not None:
+            if select.select([owner_fd], [], [], 0.1)[0]:
+                owner_gone()
+        else:
+            if start_time() != identity:
+                owner_gone()
+            time.sleep(0.1)
+    result = child.returncode
+except BaseException:
+    owner_gone()
+finally:
+    if owner_fd is not None:
+        os.close(owner_fd)
+sys.exit(result if result >= 0 else 128 - result)
+"""
+
+
+def _owned_linux_command(command: list[str]) -> list[str]:
+    """Keep a Linux child group bound to its owner process, across threads."""
+    return [sys.executable, "-I", "-c", _LINUX_GUARD, str(os.getpid()), *command]
 
 
 class RuntimeErrorDetail(Exception):
@@ -180,7 +233,10 @@ class ManagedServer:
                 options["start_new_session"] = True
             self.emit(f"Запуск модели; журнал: {self.log_path}")
             try:
-                self._process = subprocess.Popen(command, **options)
+                launch_command = command
+                if sys.platform.startswith("linux"):
+                    launch_command = _owned_linux_command(command)
+                self._process = subprocess.Popen(launch_command, **options)
                 if self._job is not None:
                     self._job.assign(self._process.pid)
             except OSError as exc:
@@ -203,7 +259,27 @@ class ManagedServer:
         """Stop only the subprocess created by this object; safe to call twice."""
         process, self._process = self._process, None
         try:
-            if process is not None and process.poll() is None:
+            if process is not None and os.name != "nt":
+                # The leader may already have exited while GPU workers remain.
+                # A private session means this never targets an existing server.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=8)
+                except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt):
+                    pass
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=5)
+                    except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt):
+                        pass
+            elif process is not None and process.poll() is None:
                 try:
                     if os.name == "nt":
                         process.terminate()
@@ -348,10 +424,19 @@ class ManagedServer:
 
     def _child_environment(self) -> dict[str, str]:
         """Retain normal model/GPU settings while removing native executors."""
-        return {
+        environment = {
             key: value for key, value in os.environ.items()
             if key.upper() not in _SERVER_TOOL_ENVIRONMENT
         }
+        if sys.platform.startswith("linux") and self.backend == "llama_cpp":
+            executable = self._server_config().get("executable")
+            if isinstance(executable, str) and executable:
+                path = Path(executable).expanduser()
+                path = path if path.is_absolute() else self.root / path
+                library_path = str(path.resolve().parent)
+                previous = environment.get("LD_LIBRARY_PATH")
+                environment["LD_LIBRARY_PATH"] = library_path + (os.pathsep + previous if previous else "")
+        return environment
 
     def _build_command(self) -> list[str]:
         server = self._server_config()
@@ -359,6 +444,8 @@ class ManagedServer:
         extra = self._extra_args()
         if self.backend == "llama_cpp":
             executable = self._resolve_file(server.get("executable"), "server.executable")
+            if os.name != "nt" and not os.access(executable, os.X_OK):
+                raise RuntimeErrorDetail(f"Нет права запуска server.executable: {executable}. Выполните chmod +x для этого файла или повторите установку.")
             model_path = self._resolve_file(server.get("model_path"), "server.model_path")
             threads = self._positive_integer(server.get("threads", 16), "server.threads")
             gpu_layers = server.get("gpu_layers", "auto")
@@ -421,8 +508,11 @@ class ManagedServer:
             assert self._process is not None
             exit_code = self._process.poll()
             if exit_code is not None:
+                hint = ""
+                if sys.platform.startswith("linux"):
+                    hint = "\nНа Linux проверьте glibc/libstdc++, libgomp1, libcurl и драйвер выбранного GPU. Официальные архивы собраны для Ubuntu; на несовместимой системе соберите llama.cpp из исходников и укажите server.executable."
                 raise RuntimeErrorDetail(
-                    f"Сервер завершился с кодом {exit_code}. Журнал: {self.log_path}\n{self._log_tail()}"
+                    f"Сервер завершился с кодом {exit_code}. Журнал: {self.log_path}\n{self._log_tail()}{hint}"
                 )
             try:
                 models = self._read_models()

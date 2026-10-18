@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -276,6 +278,27 @@ class RagTests(unittest.TestCase):
         folder_result = session.command("add .")
         self.assertIn("пропущено 1", folder_result)
         self.assertFalse(session.path.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux FIFO document access")
+    def test_fifo_document_is_rejected_without_waiting_for_a_writer(self):
+        path = self.root / "pipe.txt"
+        os.mkfifo(path)
+        source = """
+import sys
+from pathlib import Path
+from llmopenchat.rag import RagError, _read_bytes
+try:
+    _read_bytes(Path(sys.argv[1]))
+except RagError:
+    print('rejected')
+else:
+    raise SystemExit('FIFO was accepted')
+"""
+        result = subprocess.run([sys.executable, "-c", source, str(path)],
+                                cwd=Path(__file__).resolve().parents[1],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "rejected")
 
     def test_utf16_cp1251_and_html_extraction(self):
         for name, raw in (("unicode.txt", "Документация сервера".encode("utf-16")),

@@ -1,0 +1,24 @@
+[Unit]
+Description=llmopenchat Telegram bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=llmopenchat
+Group=llmopenchat
+WorkingDirectory=/opt/llmopenchat
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+EnvironmentFile=-/etc/default/llmopenchat
+ExecStart=/opt/llmopenchat/.venv/bin/python -m llmopenchat --config /opt/llmopenchat/config.json telegram
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

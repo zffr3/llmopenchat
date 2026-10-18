@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from llmopenchat import telegram
+from llmopenchat._files import supported
 from llmopenchat.api import ApiError, StreamEvent
 from llmopenchat.config import DEFAULT_CONFIG
 from llmopenchat.harness import HarnessSettings, ToolRequest
@@ -377,7 +378,7 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(user.config["system_prompt"], "Из файла")
         self.assertEqual(load_session(user.directory / "current.json"), seed)
 
-    @unittest.skipUnless(os.name == "nt", "Strict repository tools require Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_harness_toggle_uses_own_workspace_and_selects_only_existing_subfolders(self):
         user = self.send("/start")
         second = self.send("/start", OTHER)
@@ -398,7 +399,7 @@ class TelegramBotTests(unittest.TestCase):
         self.bot.command(user, USER, "/tools off")
         self.assertEqual(user.settings, HarnessSettings())
 
-    @unittest.skipUnless(os.name == "nt", "Strict repository tools require Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_powershell_menu_is_independent_and_uses_guarded_personal_repository(self):
         user = self.send("/start")
         second = self.send("/start", OTHER)

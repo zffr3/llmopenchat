@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -43,6 +44,12 @@ class OllamaSetupTests(unittest.TestCase):
         self.runtime_patch = patch("llmopenchat.setup._install_runtime", return_value=self.runtime)
         self.converter_patch = patch("llmopenchat.gguf_compat.convert_glm4moelite", return_value=self.compatibility)
         self.disk_patch = patch("llmopenchat.setup.shutil.disk_usage", return_value=SimpleNamespace(free=100 * 1024**3))
+        self.platform_patch = patch.object(setup, "os", SimpleNamespace(name="nt", environ=os.environ))
+        self.machine_patch = patch.object(setup.platform, "machine", return_value="AMD64")
+        self.platform_patch.start()
+        self.machine_patch.start()
+        self.addCleanup(self.platform_patch.stop)
+        self.addCleanup(self.machine_patch.stop)
         self.download = self.download_patch.start()
         self.install_runtime = self.runtime_patch.start()
         self.converter = self.converter_patch.start()
@@ -55,8 +62,8 @@ class OllamaSetupTests(unittest.TestCase):
     def install(self):
         return setup.install_ollama_local(self.root, emit=self.emit)
 
-    def test_windows_x64_guard_runs_before_disk_checks_or_transfers(self):
-        for system, machine in (("posix", "x86_64"), ("nt", "arm64")):
+    def test_unsupported_platform_guard_runs_before_disk_checks_or_transfers(self):
+        for system, machine in (("posix", "i686"), ("nt", "arm64")):
             with self.subTest(system=system, machine=machine):
                 with patch("llmopenchat.setup.os.name", system), patch("llmopenchat.setup.platform.machine", return_value=machine):
                     with self.assertRaisesRegex(setup.SetupError, "Windows x64"):

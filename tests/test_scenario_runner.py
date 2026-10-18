@@ -18,6 +18,7 @@ from llmopenchat.config import DEFAULT_CONFIG
 from llmopenchat.harness import ToolRequest
 from llmopenchat.scenario_runner import MAX_RESPONSE_BYTES, ScenarioRunner
 from llmopenchat.scenarios import HostPolicy, Scenario, ScenarioError, ScenarioHarness, ScenarioOutput
+from llmopenchat._files import supported
 
 
 SCHEMA = {
@@ -284,7 +285,7 @@ class ScenarioRunnerTests(unittest.TestCase):
                 runner.deliver(VALUE)
             self.assertNotIn(secret, str(error.exception))
 
-    @unittest.skipUnless(os.name == "nt", "Strict repository tools require Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_replaced_repository_root_is_rejected_for_next_request(self):
         with tempfile.TemporaryDirectory(prefix="llmopenchat-scenario-boundary-") as directory:
             root = Path(directory) / "repository"

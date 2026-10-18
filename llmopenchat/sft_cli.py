@@ -11,7 +11,7 @@ import subprocess
 import sys
 from typing import Callable
 
-from .runtime import _WindowsJob
+from .runtime import _WindowsJob, _owned_linux_command
 
 
 def add_sft_parser(commands) -> None:
@@ -69,11 +69,14 @@ def launch_training(root: Path, *, job: Path | None = None, python: Path | None 
     environment["PYTHONIOENCODING"] = "utf-8"
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     guard = _WindowsJob() if os.name == "nt" else None
+    if sys.platform.startswith("linux"):
+        argv = _owned_linux_command(argv)
     process = None
     try:
         process = subprocess.Popen(argv, cwd=root, env=environment, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                                   errors="replace", creationflags=flags)
+                                   errors="replace", creationflags=flags,
+                                   start_new_session=os.name != "nt")
         if guard is not None:
             guard.assign(process.pid)
         assert process.stdout is not None
@@ -85,31 +88,52 @@ def launch_training(root: Path, *, job: Path | None = None, python: Path | None 
         if process is None:
             return 130
         try:
-            process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+            if os.name == "nt":
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(process.pid, signal.SIGINT)
             process.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
-            process.terminate()
+            _stop_training(process)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _stop_training(process, kill=True)
                 process.wait(timeout=5)
         return 130
     finally:
         try:
             if process is not None:
                 if process.poll() is None:
-                    process.terminate()
+                    _stop_training(process)
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        process.kill()
+                        _stop_training(process, kill=True)
                         process.wait(timeout=5)
                 if process.stdout is not None:
                     process.stdout.close()
+                if os.name != "nt":
+                    # Data-loader workers may outlive their trainer process.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
         finally:
             if guard is not None:
                 guard.close()
+
+
+def _stop_training(process, *, kill=False) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL if kill else signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    elif kill:
+        process.kill()
+    else:
+        process.terminate()
 
 
 def dispatch_sft(args: argparse.Namespace, root: Path, *, emit=print, console=None) -> int:

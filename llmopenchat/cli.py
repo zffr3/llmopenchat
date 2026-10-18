@@ -35,6 +35,7 @@ from .sft_cli import add_sft_parser, dispatch_sft
 from .scenario_cli import add_scenario_parser, dispatch_scenario, scenario_menu
 from .runtime import ManagedServer, RuntimeErrorDetail
 from .terminal import terminal_text
+from .lifecycle import termination_signals
 from .telegram import run_telegram
 
 console = Console(highlight=False)
@@ -358,11 +359,19 @@ def doctor(config: dict, root: Path) -> int:
             path = root / path
         say(f"{name}: {path} ({'найден' if path.is_file() else 'не установлен'})")
     say(f"Backend: {config['backend']}\nAPI: {config['base_url']}\nМодель: {config['target_model']}")
+    if sys.platform.startswith("linux"):
+        from .powershell import availability_error
+        say("PowerShell: " + (availability_error() or "готов (системный pwsh и prlimit)"))
     say("Исходная GLM-5.3 FP8: ~756 ГБ весов, пример автора — 8×H200. На RTX 4070 Ti SUPER / 64 ГБ ОЗУ не помещается.")
     return 0
 
 
 def main(argv=None) -> int:
+    with termination_signals():
+        return _main(argv)
+
+
+def _main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -409,7 +418,7 @@ def main(argv=None) -> int:
     for action in ("use", "remove"):
         model_sub = model_commands.add_parser(action, help="Выбрать пакет" if action == "use" else "Удалить неактивный пакет")
         model_sub.add_argument("package_id", help="ID из models list")
-    install = commands.add_parser("install", help="Установить GPU-сервер и скачать выбранную GGUF-модель")
+    install = commands.add_parser("install", help="Установить локальный сервер и скачать выбранную GGUF-модель")
     install.add_argument("--model", help="ID из models catalog: скачать, установить и выбрать модель")
     install.add_argument("--quant", help="Квантизация для --model, по умолчанию Q4_K_M")
     install.add_argument("--source", choices=("ollama", "huggingface"), default="ollama", help="Источник весов (по умолчанию репозиторий автора в Ollama)")
@@ -440,7 +449,8 @@ def main(argv=None) -> int:
                 manager = ModelManager(ROOT, emit=say)
                 record = manager.install(args.model, args.quant or "Q4_K_M")
                 config = manager.activate(record["id"], config, args.config)
-                say(f"Установлена и выбрана модель: {record['name']}.\nКонфигурация: {args.config}\nЗапуск: Start-Chat.cmd")
+                launcher = "Start-Chat.cmd" if os.name == "nt" else "./Start-Chat.sh"
+                say(f"Установлена и выбрана модель: {record['name']}.\nКонфигурация: {args.config}\nЗапуск: {launcher}")
                 return 0
             if args.quant is not None:
                 raise ModelError("Параметр --quant требует --model с ID из каталога.")
@@ -470,7 +480,8 @@ def main(argv=None) -> int:
                 if extra_args[index:index + 2] == ["--chat-template-file", "llmopenchat/templates/GLM-4.7-Flash.jinja"]:
                     del extra_args[index:index + 2]
             write_config(args.config, config)
-            say(f"Установлено. Конфигурация: {args.config}\nЗапуск: Start-Chat.cmd")
+            launcher = "Start-Chat.cmd" if os.name == "nt" else "./Start-Chat.sh"
+            say(f"Установлено. Конфигурация: {args.config}\nЗапуск: {launcher}")
             return 0
         if args.command == "doctor":
             return doctor(config, ROOT)

@@ -19,6 +19,7 @@ from llmopenchat.config import DEFAULT_CONFIG
 from llmopenchat.harness import HarnessError, HarnessSettings, ToolHarness, ToolRequest
 from llmopenchat.harness_status import HarnessStatus
 from llmopenchat.history import load_session, save_session
+from llmopenchat._files import supported
 
 
 def call(identifier="call-1", name="read_file", arguments='{"path":"main.py"}'):
@@ -107,7 +108,7 @@ class ToolsCliTests(unittest.TestCase):
         self.assertEqual(config, DEFAULT_CONFIG)
         self.assertEqual(list(self.root.iterdir()), [])
 
-    @unittest.skipUnless(os.name == "nt", "Repository identity requires Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_selected_repository_identity_survives_toggles_and_rejects_replacement(self):
         repository = self.root / "repo"
         repository.mkdir()
@@ -124,7 +125,7 @@ class ToolsCliTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             ToolHarness(enabled, lambda request: True)
 
-    @unittest.skipUnless(os.name == "nt", "Repository identity requires Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_selecting_repository_immediately_enables_code_tools(self):
         repository = self.root / "CodeRepo"
         repository.mkdir()
@@ -138,7 +139,7 @@ class ToolsCliTests(unittest.TestCase):
         self.assertIn(f"Код включён. Репозиторий: {repository}", self.output.getvalue())
         self.assertEqual(list(repository.iterdir()), [])
 
-    @unittest.skipUnless(os.name == "nt", "Repository identity requires Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_cancelled_or_invalid_repository_selection_preserves_previous_access(self):
         repository = self.root / "repo"
         repository.mkdir()
@@ -152,7 +153,7 @@ class ToolsCliTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["2", "", "0"]):
             self.assertEqual(menu.tools_menu(HarnessSettings(), self.root, self.console), HarnessSettings())
 
-    @unittest.skipUnless(os.name == "nt", "Repository identity requires Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_code_toggle_reports_status_and_new_selection_resets_identity(self):
         repository = self.root / "repo"
         repository.mkdir()
@@ -233,7 +234,7 @@ class ToolsCliTests(unittest.TestCase):
         self.assertEqual(status.compact(), "Харнес: выключен · F3 — подключить")
         self.assertNotIn("project/main.cs", status.details())
 
-    @unittest.skipUnless(os.name == "nt", "Strict repository tools require Windows handles")
+    @unittest.skipUnless(supported(), "Secure repository access requires Windows or Linux")
     def test_powershell_has_independent_human_menu_toggle_and_repository(self):
         repository = self.root / "scripts"
         repository.mkdir()

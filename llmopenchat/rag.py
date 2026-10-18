@@ -129,7 +129,10 @@ def _read_bytes(path: Path) -> bytes:
         for component in path.parts[1:-1]:
             directory = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
             handles.append(directory)
-        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        # Opening a FIFO for reading would otherwise block before fstat can
+        # reject it. Nonblocking has no effect on ordinary document files.
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                             dir_fd=directory)
         handles.append(descriptor)
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
