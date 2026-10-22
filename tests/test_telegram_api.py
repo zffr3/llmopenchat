@@ -60,7 +60,10 @@ class TelegramAPITests(unittest.TestCase):
     def test_polling_uses_explicit_allowed_updates_and_timeout_margin(self):
         self.opener.open.side_effect = [response([{"update_id": 10}]), response([])]
         self.assertEqual(self.api.get_updates(offset=11), [{"update_id": 10}])
-        self.assertEqual(self.payload(), {"offset": 11, "timeout": 25, "allowed_updates": ["message", "callback_query"]})
+        self.assertEqual(self.payload(), {
+            "offset": 11, "timeout": 25,
+            "allowed_updates": ["message", "callback_query", "business_connection", "business_message"],
+        })
         self.assertEqual(self.opener.open.call_args_list[0].kwargs["timeout"], 35)
         self.assertEqual(self.api.get_updates(timeout=0), [])
         self.assertNotIn("offset", self.payload(1))
@@ -80,6 +83,34 @@ class TelegramAPITests(unittest.TestCase):
         self.assertEqual(payloads[-1]["reply_markup"], markup)
         self.assertTrue(all("parse_mode" not in payload for payload in payloads))
         self.assertEqual(result["message_id"], len(payloads))
+
+    def test_business_messages_keep_connection_on_every_chunk(self):
+        self.opener.open.side_effect = lambda *args, **kwargs: response({"message_id": self.opener.open.call_count})
+        markup = {"inline_keyboard": [[{"text": "Готово", "callback_data": "done"}]]}
+
+        result = self.api.send_message(42, "я" * 4097, markup, business_connection_id="connection-1")
+
+        self.assertEqual(self.opener.open.call_count, 2)
+        self.assertEqual(self.payload(), {
+            "chat_id": 42, "text": "я" * 4096, "business_connection_id": "connection-1",
+        })
+        self.assertEqual(self.payload(1), {
+            "chat_id": 42, "text": "я", "business_connection_id": "connection-1", "reply_markup": markup,
+        })
+        self.assertEqual(result, {"message_id": 2})
+
+    def test_get_business_connection_uses_official_method_and_rejects_malformed_result(self):
+        connection = {"id": "connection-1", "user": {"id": 123}, "is_enabled": True, "rights": {"can_reply": True}}
+        self.opener.open.return_value = response(connection)
+
+        self.assertEqual(self.api.get_business_connection("connection-1"), connection)
+        self.assertEqual(self.payload(), {"business_connection_id": "connection-1"})
+        self.assertEqual(self.opener.open.call_args.args[0].full_url, f"https://api.telegram.org/bot{TOKEN}/getBusinessConnection")
+
+        for result in (None, [], True, "connection-1"):
+            with self.subTest(result=result), self.assertRaises(TelegramError):
+                self.opener.open.return_value = response(result)
+                self.api.get_business_connection("connection-1")
 
     def test_exact_limit_is_one_message_and_invalid_unicode_never_sends_partial_text(self):
         self.api.send_message(10, "🦊" * 2048)
@@ -101,6 +132,17 @@ class TelegramAPITests(unittest.TestCase):
         self.assertEqual(self.payload(2), {"commands": commands})
         self.assertEqual(self.api.get_me(), {"id": 123})
         self.assertEqual(self.opener.open.call_args.args[0].full_url.rsplit("/", 1)[1], "getMe")
+
+    def test_business_reply_markup_edit_includes_connection(self):
+        self.opener.open.return_value = response(True)
+
+        self.api.edit_message_reply_markup(42, 9, business_connection_id="connection-1")
+
+        self.assertEqual(self.payload(), {
+            "chat_id": 42, "message_id": 9,
+            "reply_markup": {"inline_keyboard": []}, "business_connection_id": "connection-1",
+        })
+        self.assertEqual(self.opener.open.call_args.args[0].full_url.rsplit("/", 1)[1], "editMessageReplyMarkup")
 
     def test_commands_can_target_a_specific_chat_scope(self):
         commands = [{"command": "tools", "description": "Подключить харнесы"}]
@@ -137,7 +179,33 @@ class TelegramAPITests(unittest.TestCase):
         self.assertEqual(parts["document"].get_filename(), "Сессия___.txt")
         self.assertNotIn(b"private", request.data)
         self.assertNotIn("parse_mode", parts)
+        self.assertNotIn("business_connection_id", parts)
         self.assertEqual(result["message_id"], 9)
+
+    def test_business_document_forwards_connection_to_media_upload(self):
+        with patch.object(self.api, "send_media", return_value={"message_id": 9}) as send_media:
+            self.assertEqual(
+                self.api.send_document(42, "file.txt", b"file", "Описание", business_connection_id="connection-1"),
+                {"message_id": 9},
+            )
+        send_media.assert_called_once_with(
+            42, "file.txt", b"file", media_type="document", caption="Описание", business_connection_id="connection-1",
+        )
+
+    def test_business_media_uploads_include_connection_in_multipart_fields(self):
+        for media_type in ("document", "photo", "video", "audio", "voice", "animation", "video_note", "sticker"):
+            with self.subTest(media_type=media_type):
+                self.opener.open.return_value = response({"message_id": 9})
+
+                self.api.send_media(42, "file", b"content", media_type=media_type, business_connection_id="connection-1")
+
+                request = self.opener.open.call_args.args[0]
+                multipart = BytesParser(policy=default).parsebytes(
+                    f"Content-Type: {request.get_header('Content-type')}\r\n\r\n".encode() + request.data
+                )
+                parts = {part.get_param("name", header="content-disposition"): part for part in multipart.iter_parts()}
+                self.assertEqual(parts["business_connection_id"].get_payload(decode=True), b"connection-1")
+                self.assertEqual(parts[media_type].get_payload(decode=True), b"content")
 
     def test_document_network_failure_is_sanitized_and_oversize_never_uploads(self):
         self.opener.open.side_effect = URLError(f"https://api.telegram.org/bot{TOKEN}/sendDocument")

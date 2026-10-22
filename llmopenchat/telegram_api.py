@@ -185,7 +185,10 @@ class TelegramAPI:
     def get_updates(self, offset: int | None = None, timeout: int = 25) -> list[dict]:
         if type(timeout) is not int or timeout < 0:
             raise TelegramError("Таймаут опроса Telegram должен быть целым неотрицательным числом.")
-        payload: dict = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+        payload: dict = {
+            "timeout": timeout,
+            "allowed_updates": ["message", "callback_query", "business_connection", "business_message"],
+        }
         if offset is not None:
             if type(offset) is not int:
                 raise TelegramError("Смещение обновлений Telegram должно быть целым числом.")
@@ -195,13 +198,18 @@ class TelegramAPI:
             raise TelegramError("Telegram Bot API вернул некорректный список обновлений.")
         return result
 
-    def send_message(self, chat_id: int | str, text: str, reply_markup: dict | None = None) -> dict:
+    def send_message(
+        self, chat_id: int | str, text: str, reply_markup: dict | None = None, *,
+        business_connection_id: str | None = None,
+    ) -> dict:
         chunks = _split_text(text, MAX_MESSAGE_UNITS)
         if not text:
             raise TelegramError("Telegram не принимает пустое сообщение.")
         result: dict = {}
         for index, chunk in enumerate(chunks):
             payload: dict = {"chat_id": chat_id, "text": chunk}
+            if business_connection_id is not None:
+                payload["business_connection_id"] = business_connection_id
             if reply_markup is not None and index == len(chunks) - 1:
                 payload["reply_markup"] = reply_markup
             response = self.call("sendMessage", payload)
@@ -255,13 +263,18 @@ class TelegramAPI:
         return self.download_file(file_id, max_bytes=max_bytes)
 
     def send_document(
-        self, chat_id: int | str, filename: str, content: bytes, caption: str = ""
+        self, chat_id: int | str, filename: str, content: bytes, caption: str = "", *,
+        business_connection_id: str | None = None,
     ) -> dict:
-        return self.send_media(chat_id, filename, content, media_type="document", caption=caption)
+        kwargs: dict = {"media_type": "document", "caption": caption}
+        if business_connection_id is not None:
+            kwargs["business_connection_id"] = business_connection_id
+        return self.send_media(chat_id, filename, content, **kwargs)
 
     def send_media(
         self, chat_id: int | str, filename: str, content: bytes, *,
         media_type: str = "document", caption: str = "",
+        business_connection_id: str | None = None,
     ) -> dict:
         """Upload supplied bytes; the filename is a label, never a local file path."""
         if not isinstance(media_type, str) or media_type not in _MEDIA_METHODS:
@@ -287,6 +300,8 @@ class TelegramAPI:
             mime_type = _MEDIA_MIME_TYPES.get(filename[dot:].lower(), mime_type) if dot >= 0 else mime_type
         try:
             fields = {"chat_id": str(chat_id).encode("utf-8")}
+            if business_connection_id is not None:
+                fields["business_connection_id"] = business_connection_id.encode("utf-8")
             if supports_caption:
                 fields["caption"] = caption.encode("utf-8")
             file_header = (
@@ -323,16 +338,23 @@ class TelegramAPI:
         return result
 
     def edit_message_reply_markup(
-        self, chat_id: int | str, message_id: int, reply_markup: dict | None = None
+        self, chat_id: int | str, message_id: int, reply_markup: dict | None = None, *,
+        business_connection_id: str | None = None,
     ) -> Any:
-        return self.call(
-            "editMessageReplyMarkup",
-            {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
-            },
-        )
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
+        }
+        if business_connection_id is not None:
+            payload["business_connection_id"] = business_connection_id
+        return self.call("editMessageReplyMarkup", payload)
+
+    def get_business_connection(self, business_connection_id: str) -> dict:
+        result = self.call("getBusinessConnection", {"business_connection_id": business_connection_id})
+        if not isinstance(result, dict):
+            raise TelegramError("Telegram Bot API вернул некорректные данные бизнес-подключения.")
+        return result
 
     def set_commands(self, commands: list[dict], *, scope: dict | None = None) -> Any:
         payload = {"commands": commands}

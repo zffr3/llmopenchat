@@ -23,6 +23,7 @@ from .models import ModelError, ModelManager
 from .rag import MAX_FILE_BYTES, SUPPORTED_SUFFIXES, RagSession
 from .runtime import ManagedServer, RuntimeErrorDetail
 from .telegram_api import MAX_DOWNLOAD_BYTES, TelegramAPI, TelegramError
+from .telegram_business import BusinessResponder
 from .telegram_media import AttachmentStore, TelegramToolHarness
 
 
@@ -327,6 +328,7 @@ class TelegramBot:
         self.shared_chat: UserChat | None = None
         self.shared_queue: deque[tuple[int, int, str, dict | None]] = deque()
         self.admin_commands_pending = False
+        self.business = BusinessResponder(api, config, self.root, self.runtime, emit)
 
     @property
     def shared_mode(self) -> bool:
@@ -605,6 +607,9 @@ class TelegramBot:
 
     def handle_update(self, update: dict) -> None:
         if not isinstance(update, dict):
+            return
+        if "business_connection" in update or "business_message" in update:
+            self.business.handle_update(update)
             return
         if isinstance(update.get("callback_query"), dict):
             self._callback(update["callback_query"])
@@ -1304,6 +1309,7 @@ class TelegramBot:
 
     def close(self) -> None:
         self.stopped.set()
+        self.business.close()
         with self.control_lock:
             self.shared_queue.clear()
             for user in self.users.values():
@@ -1356,6 +1362,8 @@ def run_telegram(config: dict, root: Path, *, whitelist_path: Path | None = None
             bot.user_chat(admin_user_id)
         runtime.start()
         emit(f"Telegram-бот @{bot.username} запущен. Разрешено пользователей: {len(allowed)}. Ctrl+C — остановить.")
+        if bot.business.enabled:
+            emit("Telegram Business: автоответы включены для бизнес-аккаунта администратора; у каждого собеседника отдельный диалог.")
         bot.poll()
         return 0
     except KeyboardInterrupt:

@@ -380,7 +380,7 @@ def _main(argv=None) -> int:
     commands = parser.add_subparsers(dest="command")
     for name in ("chat", "ask", "telegram"):
         description = {"chat": "Интерактивный чат", "ask": "Один запрос и выход",
-                       "telegram": "Telegram-бот: администратор и клиенты с общей сессией либо отдельные диалоги"}[name]
+                       "telegram": "Telegram-бот: общая сессия, отдельные диалоги или ответы от бизнес-аккаунта"}[name]
         sub = commands.add_parser(name, help=description)
         sub.add_argument("--no-autostart", action="store_true", help="Подключиться к уже запущенному API")
         sub.add_argument("--max-tokens", type=int)
@@ -395,6 +395,8 @@ def _main(argv=None) -> int:
             sub.add_argument("--whitelist", type=Path, help="Файл разрешённых Telegram username через запятую (по умолчанию whitelist.txt)")
             sub.add_argument("--credits", type=Path, help="Файл токена Telegram-бота (по умолчанию credits.txt)")
             sub.add_argument("--admin-id", type=int, help="Положительный Telegram user ID администратора: общая сессия для всех клиентов; узнать ID — /id")
+            sub.add_argument("--business", "--userbot", dest="business", action="store_true",
+                             help="Отвечать от подключённого бизнес-аккаунта; требуется --admin-id владельца или telegram.admin_user_id в конфигурации")
     commands.add_parser("menu", help="Главное меню: чат, история, модели, Telegram-бот, RAG, SFT и сценарии")
     add_sft_parser(commands)
     add_scenario_parser(commands)
@@ -511,6 +513,8 @@ def _main(argv=None) -> int:
             config["show_reasoning"] = True
         if getattr(args, "admin_id", None) is not None:
             config.setdefault("telegram", {})["admin_user_id"] = args.admin_id
+        if getattr(args, "business", False):
+            config.setdefault("telegram", {})["business_enabled"] = True
         validate_config(config)
         if args.command == "telegram":
             return run_telegram(config, ROOT, whitelist_path=args.whitelist,

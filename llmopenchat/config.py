@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "telegram": {
         "admin_user_id": None,
         "repository": None,
+        "business_enabled": False,
     },
     "server": {
         "executable": _default_executable(),
@@ -130,6 +131,11 @@ def validate_config(config: dict) -> None:
     admin_user_id = telegram.get("admin_user_id")
     if admin_user_id is not None and (type(admin_user_id) is not int or admin_user_id <= 0):
         raise ConfigError("telegram.admin_user_id должен быть положительным целым Telegram user ID или null.")
+    business_enabled = telegram.get("business_enabled", False)
+    if type(business_enabled) is not bool:
+        raise ConfigError("telegram.business_enabled должен быть true или false.")
+    if business_enabled and admin_user_id is None:
+        raise ConfigError("Для telegram.business_enabled укажите telegram.admin_user_id владельца бизнес-аккаунта.")
     repository = telegram.get("repository")
     if repository is not None:
         if not isinstance(repository, str) or not repository.strip() or "\x00" in repository:

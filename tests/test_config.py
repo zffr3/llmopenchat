@@ -24,6 +24,7 @@ class ConfigTests(unittest.TestCase):
         loaded["server"]["threads"] = 1
         loaded["request_extra"]["chat_template_kwargs"]["enable_thinking"] = True
         loaded["telegram"]["admin_user_id"] = 123456789
+        loaded["telegram"]["business_enabled"] = True
         self.assertEqual(load_config(self.path), DEFAULT_CONFIG)
 
     def test_partial_server_settings_keep_other_defaults(self):
@@ -43,12 +44,35 @@ class ConfigTests(unittest.TestCase):
 
     def test_telegram_legacy_defaults_and_partial_admin_settings(self):
         self.assertEqual(load_config(self.path)["telegram"], {
-            "admin_user_id": None, "repository": None,
+            "admin_user_id": None, "repository": None, "business_enabled": False,
         })
         self.write_json({"telegram": {"admin_user_id": 123456789}})
         self.assertEqual(load_config(self.path)["telegram"], {
-            "admin_user_id": 123456789, "repository": None,
+            "admin_user_id": 123456789, "repository": None, "business_enabled": False,
         })
+
+    def test_telegram_business_mode_requires_explicit_boolean_and_owner(self):
+        for value in (None, 0, 1, "true", [], {}):
+            with self.subTest(business_enabled=value):
+                self.write_json({"telegram": {
+                    "admin_user_id": 123456789, "business_enabled": value,
+                }})
+                with self.assertRaisesRegex(ConfigError, "telegram.business_enabled"):
+                    load_config(self.path)
+        self.write_json({"telegram": {"business_enabled": True}})
+        with self.assertRaisesRegex(ConfigError, "telegram.admin_user_id"):
+            load_config(self.path)
+
+    def test_telegram_business_mode_round_trips_with_owner_and_legacy_settings(self):
+        self.write_json({"telegram": {
+            "admin_user_id": 123456789,
+            "business_enabled": True,
+            "repository": "projects/shared",
+        }})
+        config = load_config(self.path)
+        self.assertTrue(config["telegram"]["business_enabled"])
+        write_config(self.path, config)
+        self.assertEqual(load_config(self.path), config)
 
     def test_telegram_repository_preserves_absolute_or_relative_path(self):
         for repository in ("projects/shared", str(self.path.parent / "репозиторий")):
