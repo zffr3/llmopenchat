@@ -3,3 +3,4 @@ prompt_toolkit>=3.0,<4
 rich>=13.9,<15
 pypdf>=6.19,<7
 jsonschema>=4.25,<5
+Pillow>=13.0.0,<14

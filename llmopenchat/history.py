@@ -15,6 +15,7 @@ from typing import Callable
 
 from .config import ROOT
 from .api import MAX_TOOL_ARGUMENT_BYTES, MAX_TOOL_CALLS, validated_tool_call
+from .vision import content_text, validate_content
 
 MAX_SESSION_BYTES = 16 * 1024 * 1024
 MAX_TITLE_LENGTH = 80
@@ -64,7 +65,12 @@ def _validated_messages(data: object) -> list[dict]:
             raise ValueError("Неверный формат диалога: неверный список вызовов инструментов.")
         if calls and content is None:
             content = ""
-        if not isinstance(content, str):
+        if role == "user" and isinstance(content, list):
+            try:
+                content = validate_content(content)
+            except ValueError:
+                raise ValueError("Неверный формат диалога: неверное мультимодальное содержимое.") from None
+        elif not isinstance(content, str):
             raise ValueError("Неверный формат диалога: нужен список messages с role и content.")
         entry = {"role": role, "content": content}
         if calls:
@@ -164,7 +170,7 @@ def new_session_path(root: Path = ROOT) -> Path:
 def _title(messages: list[dict]) -> str:
     for message in messages:
         if message["role"] == "user":
-            text = " ".join(message["content"].split())
+            text = " ".join(content_text(message["content"]).split())
             # User content is printed by the history menu; remove invisible
             # formatting and terminal control characters from its title.
             text = "".join(character for character in text if not unicodedata.category(character).startswith("C"))

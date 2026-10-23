@@ -36,6 +36,14 @@ DEFAULT_CONFIG = {
     "show_reasoning": False,
     "request_timeout": 600,
     "request_extra": {"chat_template_kwargs": {"enable_thinking": False}},
+    "vision": {
+        "enabled": False,
+        "max_input_bytes": 10 * 1024 * 1024,
+        "max_pixels": 24_000_000,
+        "max_side": 1536,
+        "max_image_bytes": 512 * 1024,
+        "max_history_images": 4,
+    },
     "rag": {
         "chunk_size": 1000,
         "chunk_overlap": 150,
@@ -114,6 +122,11 @@ def validate_config(config: dict) -> None:
     reserved = {"model", "messages", "stream", "stream_options", "max_tokens", "temperature", "tools", "tool_choice", "parallel_tool_calls"}
     if reserved & config["request_extra"].keys():
         raise ConfigError("request_extra не должен переопределять основные поля запроса.")
+    from .vision import VisionError, VisionSettings
+    try:
+        VisionSettings.from_config(config)
+    except VisionError as error:
+        raise ConfigError(str(error)) from error
     rag = config.get("rag", DEFAULT_CONFIG["rag"])
     if not isinstance(rag, dict):
         raise ConfigError("rag должен быть JSON-объектом.")

@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from ._winfiles import FileAccessError, LockedHandle, LockedRepository, supported
+from .vision import content_text
 
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -540,8 +541,8 @@ class RagSession:
     def prepare(self, messages: list[dict]) -> RagContext:
         if not self.enabled:
             return RagContext("", [])
-        query = next((message.get("content", "") for message in reversed(messages)
-                      if message.get("role") == "user" and isinstance(message.get("content"), str)), "")
+        query = next((content_text(message.get("content", "")) for message in reversed(messages)
+                      if message.get("role") == "user"), "")
         sources = self.search(query)
         if not sources:
             return RagContext("Режим RAG включён, но подходящих фрагментов не найдено. Сообщи, что в локальной базе нет данных для ответа; не выдумывай сведения или ссылки на источники.", [])

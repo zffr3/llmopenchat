@@ -17,6 +17,7 @@ from .api import ApiClient, ApiError
 from .conversation import GenerationCancelled, generate_response, initial_messages
 from .history import load_session, new_session_path, save_session
 from .telegram_api import TelegramAPI, TelegramError
+from .vision import VisionError, VisionSettings, image_message, incoming_image, prune_images
 
 
 MAX_PENDING_MESSAGES = 100
@@ -34,7 +35,7 @@ class BusinessChat:
     directory: Path
     messages: list[dict]
     session_path: Path
-    pending: deque[tuple[int, str]] = field(default_factory=deque)
+    pending: deque[tuple[int, str, dict | None]] = field(default_factory=deque)
     seen: set[int] = field(default_factory=set)
     seen_order: deque[int] = field(default_factory=deque)
     delivered: deque[int] = field(default_factory=deque)
@@ -129,15 +130,14 @@ class BusinessResponder:
             return
         text = message.get("text")
         prompt = text.strip() if isinstance(text, str) else ""
+        image = incoming_image(message)
         media = next((label for kind, label in _MEDIA.items() if message.get(kind)), None)
         if media is not None:
             caption = message.get("caption")
             prompt = caption.strip() if isinstance(caption, str) else ""
-            prompt += ("\n\n" if prompt else "") + (
-                f"[Вложение Telegram: {media}. Содержимое вложения недоступно модели. "
-                "Не утверждай, что просмотрел или прослушал его; при необходимости попроси текстовое описание.]"
-            )
-        if not prompt:
+            if image is None:
+                prompt = self._unavailable_media(prompt, media)
+        if not prompt and image is None:
             return
         with self.lock:
             known = identifier in self.connections
@@ -171,7 +171,8 @@ class BusinessResponder:
             chat.seen_order.append(message_id)
             if len(chat.seen_order) > MAX_SEEN_MESSAGES:
                 chat.seen.discard(chat.seen_order.popleft())
-            chat.pending.append((message_id, prompt))
+            # Download in the authorized worker, never in Telegram's polling thread.
+            chat.pending.append((message_id, prompt, copy.deepcopy(image)))
             self._pending_count += 1
             if chat is not self._active and key not in self._scheduled:
                 self._ready.append(chat)
@@ -246,12 +247,12 @@ class BusinessResponder:
                         chat.pending.clear()
                         chat.worker = None
                         continue
-                    message_id, prompt = chat.pending.popleft()
+                    message_id, prompt, image = chat.pending.popleft()
                     self._pending_count -= 1
                     self._active = chat
                     chat.cancelled.clear()
                 try:
-                    self._generate(chat, message_id, prompt)
+                    self._generate(chat, message_id, prompt, image)
                 except GenerationCancelled:
                     pass
                 except (ApiError, TelegramError, OSError, ValueError):
@@ -283,18 +284,63 @@ class BusinessResponder:
                     self._active = None
                     self._worker = None
 
-    def _generate(self, chat: BusinessChat, message_id: int, prompt: str) -> None:
+    @staticmethod
+    def _unavailable_media(prompt: str, media: str) -> str:
+        return prompt + ("\n\n" if prompt else "") + (
+            f"[Вложение Telegram: {media}. Содержимое вложения недоступно модели. "
+            "Не утверждай, что просмотрел или прослушал его; при необходимости попроси текстовое описание.]"
+        )
+
+    def _image_prompt(self, chat: BusinessChat, prompt: str, image: dict, config: dict) -> str | list[dict]:
+        settings = VisionSettings.from_config(config)
+        if not settings.enabled:
+            return self._unavailable_media(prompt, "фото" if image.get("media_type") == "photo" else "файл")
+        identifier, size = image.get("file_id"), image.get("file_size")
+        if (not isinstance(identifier, str) or not identifier or len(identifier) > 1024
+                or (size is not None and (type(size) is not int or not 0 <= size <= settings.max_input_bytes))):
+            raise VisionError("Изображение превышает допустимый размер или содержит некорректные сведения.")
+        if self._cancelled(chat):
+            raise GenerationCancelled("Запрос Telegram Business отменён.")
+        try:
+            content = self.api.download_file(identifier, max_bytes=settings.max_input_bytes)
+        except (TelegramError, OSError, ValueError):
+            raise VisionError("Не удалось скачать изображение из Telegram.") from None
+        if self._cancelled(chat):
+            raise GenerationCancelled("Запрос Telegram Business отменён.")
+        return image_message(prompt or "Опиши изображение.", content, config)
+
+    def _generate(self, chat: BusinessChat, message_id: int, prompt: str,
+                  image: dict | None = None) -> None:
         while not self.runtime.lock.acquire(timeout=0.25):
             if self._cancelled(chat):
                 raise GenerationCancelled("Запрос Telegram Business отменён.")
         try:
             if self._cancelled(chat):
                 raise GenerationCancelled("Запрос Telegram Business отменён.")
-            client = ApiClient(copy.deepcopy(self.runtime.config))
+            config = copy.deepcopy(self.runtime.config)
+            try:
+                content = self._image_prompt(chat, prompt, image, config) if image is not None else prompt
+            except VisionError:
+                if self._cancelled(chat):
+                    raise GenerationCancelled("Запрос Telegram Business отменён.")
+                self.api.send_message(chat.chat_id,
+                                      "Не удалось обработать изображение. Пришлите JPEG, PNG или WebP "
+                                      "в пределах настроенных ограничений либо опишите изображение текстом.",
+                                      business_connection_id=chat.connection_id)
+                try:
+                    self._save_receipt(chat, message_id)
+                except (OSError, ValueError):
+                    self.emit("Telegram Business: не удалось сохранить ID доставленного сообщения.")
+                return
+            if self._cancelled(chat):
+                raise GenerationCancelled("Запрос Telegram Business отменён.")
+            client = ApiClient(config)
             with self.lock:
                 chat.client = client
-            proposed = copy.deepcopy(chat.messages) + [{"role": "user", "content": prompt}]
-            result = generate_response(client, proposed, cancelled=lambda: self._cancelled(chat))
+            proposed = copy.deepcopy(chat.messages) + [{"role": "user", "content": content}]
+            prune_images(proposed, config)
+            result = generate_response(client, proposed, cancelled=lambda: self._cancelled(chat),
+                                       vision_enabled=VisionSettings.from_config(config).enabled)
             if self._cancelled(chat):
                 raise GenerationCancelled("Запрос Telegram Business отменён.")
             if not result.answer.strip():

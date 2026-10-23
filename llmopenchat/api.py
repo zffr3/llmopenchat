@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 import ipaddress
 
+from .vision import content_text, has_images, prune_images, validate_content
+
 
 class ApiError(RuntimeError):
     pass
@@ -25,6 +27,55 @@ MAX_TOOL_ARGUMENT_BYTES = 256 * 1024
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _TOOL_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _TOOL_REQUEST_FIELDS = {"tools", "tool_choice", "parallel_tool_calls"}
+_DATA_IMAGE = re.compile(r"data:image/[^\s,;\"'<>]+;base64,[A-Za-z0-9+/=]*", re.IGNORECASE)
+_LONG_BASE64 = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{64,}={0,2}")
+_ERROR_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_BOT_TOKEN = re.compile(r"(?<![0-9])[0-9]+:[A-Za-z0-9_-]{10,}\b")
+_VISION_UNAVAILABLE = (
+    "Изображения недоступны в текущем запросе: vision.enabled выключен. "
+    "Не утверждай, что видел или распознал содержимое изображений. "
+    "Для анализа попроси включить vision и отправить изображение снова."
+)
+
+
+def _error_detail(value: object) -> str:
+    """Keep useful server diagnostics without echoing credentials or image bytes."""
+    detail = str(value)
+    api_key = os.environ.get("LLMOPENCHAT_API_KEY")
+    if api_key:
+        detail = detail.replace(api_key, "[ключ скрыт]")
+    detail = _ERROR_URL.sub("[URL скрыт]", detail)
+    detail = _BOT_TOKEN.sub("[токен скрыт]", detail)
+    detail = _DATA_IMAGE.sub("[изображение скрыто]", detail)
+    detail = _LONG_BASE64.sub("[данные скрыты]", detail)
+    return " ".join(detail.split())[:1500]
+
+
+def _outbound_messages(messages: list[dict], vision_enabled: bool) -> list[dict]:
+    """Copy multimodal parts and enforce the explicit vision switch at transport."""
+    outbound = []
+    unavailable = False
+    for message in messages:
+        entry = dict(message)
+        content = entry.get("content")
+        if isinstance(content, list):
+            if entry.get("role") != "user":
+                raise ApiError("Изображения разрешены только в сообщениях пользователя.")
+            try:
+                content = validate_content(content)
+            except ValueError:
+                raise ApiError("Неверное мультимодальное содержимое сообщения пользователя.") from None
+            if vision_enabled:
+                entry["content"] = content
+            else:
+                unavailable = unavailable or has_images(content)
+                entry["content"] = content_text(content)
+        outbound.append(entry)
+    if unavailable:
+        position = next((index for index, message in enumerate(outbound)
+                         if message.get("role") != "system"), len(outbound))
+        outbound.insert(position, {"role": "system", "content": _VISION_UNAVAILABLE})
+    return outbound
 
 
 def validated_tool_call(value: object) -> dict:
@@ -213,14 +264,22 @@ class ApiClient:
             raise ApiError("tool_choice должен быть auto, required или none.")
         if not allowed_names and tool_choice not in (None, "none"):
             raise ApiError("Выбор инструмента требует подключённых в этом чате инструментов.")
+        vision = self.config.get("vision", {})
+        vision_enabled = isinstance(vision, dict) and vision.get("enabled") is True
+        outbound = _outbound_messages(messages, vision_enabled)
+        try:
+            prune_images(outbound, self.config)
+        except ValueError:
+            raise ApiError("Неверные настройки vision для запроса модели.") from None
+        images_sent = any(has_images(message.get("content")) for message in outbound)
         payload = {
             "model": self.config["model"],
-            "messages": messages,
+            "messages": outbound,
             "temperature": self.config["temperature"],
             "max_tokens": self.config["max_tokens"],
             "stream": True,
             "stream_options": {"include_usage": True},
-            **{key: value for key, value in self.config.get("request_extra", {}).items() if key not in _TOOL_REQUEST_FIELDS},
+            **{key: value for key, value in self.config.get("request_extra", {}).items() if key not in _TOOL_REQUEST_FIELDS | {"messages"}},
             "tool_choice": (tool_choice or "auto") if allowed_names else "none",
         }
         if allowed_names:
@@ -263,7 +322,7 @@ class ApiClient:
                     if not isinstance(chunk, dict):
                         raise ApiError("Неверный формат ответа сервера.")
                     if chunk.get("error"):
-                        raise ApiError(str(chunk["error"]))
+                        raise ApiError(_error_detail(chunk["error"]))
                     choices = chunk.get("choices", [])
                     if not isinstance(choices, list):
                         raise ApiError("Неверный формат choices в ответе сервера.")
@@ -316,11 +375,16 @@ class ApiClient:
         except HTTPError as error:
             try:
                 detail = error.read(8192).decode("utf-8", errors="replace")
+            except (OSError, HTTPException):
+                detail = "Не удалось прочитать описание ошибки сервера."
             finally:
                 error.close()
-            raise ApiError(f"HTTP {error.code}: {detail}") from error
+            prefix = ("Модель не приняла изображение. Нужны vision-модель и мультимодальный проектор, "
+                      "подключённый к llama-server через --mmproj. "
+                      if images_sent and error.code in {400, 422} else "")
+            raise ApiError(f"{prefix}HTTP {error.code}: {_error_detail(detail)}") from None
         except (URLError, TimeoutError, OSError, HTTPException) as error:
-            raise ApiError(f"Не удалось получить ответ модели: {error}") from error
+            raise ApiError(f"Не удалось получить ответ модели: {_error_detail(error)}") from None
         finally:
             with self._response_lock:
                 self._response = None

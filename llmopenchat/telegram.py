@@ -25,6 +25,7 @@ from .runtime import ManagedServer, RuntimeErrorDetail
 from .telegram_api import MAX_DOWNLOAD_BYTES, TelegramAPI, TelegramError
 from .telegram_business import BusinessResponder
 from .telegram_media import AttachmentStore, TelegramToolHarness
+from .vision import VisionSettings, image_candidate, prepare_image, prune_images
 
 
 APPROVAL_TIMEOUT = 300.0
@@ -91,6 +92,7 @@ HELP = """/start — открыть свой чат
 Каждый вызов харнеса требует отдельного апрува кнопкой.
 Можно отправлять файлы, фото, видео, аудио, голосовые и стикеры.
 Подпись к вложению — запрос модели; без подписи файл сохраняется для следующего запроса.
+При включённом vision фото анализируется сразу, в том числе без подписи.
 Текст, PDF и DOCX также добавляются в RAG; /rag on — включить поиск.
 Для скачивания файлов по ссылкам: /tools http on. Отправка файлов требует апрува.
 Модель общая для бота; контекст, файлы, база знаний и доступы — персональные."""
@@ -916,6 +918,7 @@ class TelegramBot:
             harness = user.harness_status or HarnessStatus(settings=user.settings, media_enabled=True)
             self._send(chat_id, f"Модель: {self.runtime.config['target_model']}\n"
                        f"Рабочая директория: {user.workspace}\n"
+                       + "Vision: " + ("включён" if VisionSettings.from_config(self.runtime.config).enabled else "выключен") + "\n"
                        + harness.details().replace("F3 — подключить", "/tools — подключить")
                        + "\n" + user.rag.status())
         elif command in {"/start", "/menu"}:
@@ -1038,17 +1041,23 @@ class TelegramBot:
         if not isinstance(mime_type, str) or not re.fullmatch(r"[\w.+-]+/[\w.+-]+", mime_type, flags=re.ASCII):
             raise ValueError("Telegram передал некорректный MIME-тип файла.")
         size = document.get("file_size")
-        if size is not None and (type(size) is not int or not 0 <= size <= MAX_DOWNLOAD_BYTES):
-            raise ValueError(f"Файл должен быть не больше {MAX_DOWNLOAD_BYTES // (1024 * 1024)} МиБ.")
+        vision = VisionSettings.from_config(self.runtime.config)
+        is_image = image_candidate(kind, filename, mime_type)
+        download_limit = min(MAX_DOWNLOAD_BYTES, vision.max_input_bytes) if vision.enabled and is_image else MAX_DOWNLOAD_BYTES
+        if size is not None and (type(size) is not int or not 0 <= size <= download_limit):
+            raise ValueError(f"Файл должен быть не больше {download_limit // (1024 * 1024)} МиБ.")
         self._send(chat_id, "Получаю файл: " + filename + ". /cancel — отменить.")
         try:
-            content = self.api.download_document(file_id, max_bytes=MAX_DOWNLOAD_BYTES)
+            content = self.api.download_document(file_id, max_bytes=download_limit)
         except TelegramError:
             raise ValueError("Не удалось скачать файл из Telegram. Повторите отправку файла.") from None
         if self._cancelled(user):
             raise GenerationCancelled("Получение файла отменено.")
-        if len(content) > MAX_DOWNLOAD_BYTES:
+        if len(content) > download_limit:
             raise ValueError("Файл превышает допустимый размер загрузки Telegram.")
+        image_part = prepare_image(content, vision) if vision.enabled and is_image else None
+        if self._cancelled(user):
+            raise GenerationCancelled("Получение изображения отменено.")
         store = self._media_store(user)
         metadata = store.add(filename, content, media_type=kind, mime_type=mime_type)
         notice = ""
@@ -1060,11 +1069,18 @@ class TelegramBot:
             except (OSError, ValueError) as error:
                 notice = f"\n\nФайл сохранён; не удалось добавить его в RAG: {error}"
         prompt = (caption + "\n\n" if caption else "") + "[Вложение Telegram]\n" + json.dumps(metadata, ensure_ascii=False)
-        if caption:
+        if image_part is not None:
+            prompt = [{"type": "text", "text": ("Рассмотри изображение.\n\n" if not caption else "") + prompt}, image_part]
+        elif is_image:
+            unavailable = "Vision выключен (vision.enabled=false): содержимое изображения модели не передано; не утверждай, что рассмотрел его."
+            prompt = unavailable + "\n\n" + prompt
+            notice += "\n\n" + unavailable
+        if caption or image_part is not None:
             self._send(chat_id, "Файл сохранён: " + filename + notice)
             self.generate(user, chat_id, prompt)
         else:
             user.messages.append({"role": "user", "content": prompt})
+            prune_images(user.messages, self.runtime.config)
             self._save(user)
             self._send(chat_id, f"Файл сохранён: {filename}\nfile_id: {metadata['file_id']}\n"
                        "Теперь можно попросить модель использовать или отправить этот файл. "
@@ -1197,7 +1213,7 @@ class TelegramBot:
         else:
             raise ValueError("/models: catalog, list, install ID [QUANT], use ПАКЕТ, remove ПАКЕТ.")
 
-    def generate(self, user: UserChat, chat_id: int, prompt: str) -> None:
+    def generate(self, user: UserChat, chat_id: int, prompt: str | list[dict]) -> None:
         harness_status = HarnessStatus(settings=user.settings, media_enabled=True)
         user.harness_status = harness_status
         accepted = "Запрос выполняется в общей сессии." if self.shared_mode else "Запрос принят. /cancel — отменить."
@@ -1210,6 +1226,7 @@ class TelegramBot:
             if self._cancelled(user):
                 raise GenerationCancelled("Запрос отменён.")
         proposed = copy.deepcopy(user.messages) + [{"role": "user", "content": prompt}]
+        prune_images(proposed, self.runtime.config)
         reasoning: list[str] = []
         content: list[str] = []
         def on_event(event):
@@ -1262,7 +1279,7 @@ class TelegramBot:
             rag_options = {"rag": user.rag} if user.rag.enabled else {}
             result = generate_response(client, proposed, harness=harness,
                                        on_event=on_event, cancelled=lambda: self._cancelled(user),
-                                       **rag_options)
+                                       vision_enabled=VisionSettings.from_config(config).enabled, **rag_options)
             user.messages = proposed + [{"role": "assistant", "content": result.answer}]
             self._save(user)
             text = ("[Рассуждение]\n" + "".join(reasoning) + "\n\n" if reasoning else "") + result.answer

@@ -42,6 +42,22 @@ class ConfigTests(unittest.TestCase):
         self.write_json({"request_extra": {"top_p": 0.8}})
         self.assertEqual(load_config(self.path)["request_extra"], {"top_p": 0.8})
 
+    def test_vision_requires_explicit_boolean_and_bounded_settings(self):
+        self.assertFalse(load_config(self.path)["vision"]["enabled"])
+        for settings in ({"enabled": "true"}, {"enabled": 1}, {"max_pixels": 100_000_000},
+                         {"max_input_bytes": 100_000_000}, {"max_side": 0},
+                         {"max_image_bytes": 100_000_000}, {"max_history_images": 100}):
+            with self.subTest(settings=settings):
+                self.write_json({"vision": settings})
+                with self.assertRaisesRegex(ConfigError, "vision"):
+                    load_config(self.path)
+        self.write_json({"vision": {"enabled": True, "max_history_images": 2}})
+        config = load_config(self.path)
+        self.assertTrue(config["vision"]["enabled"])
+        self.assertEqual(config["vision"]["max_history_images"], 2)
+        write_config(self.path, config)
+        self.assertEqual(load_config(self.path), config)
+
     def test_telegram_legacy_defaults_and_partial_admin_settings(self):
         self.assertEqual(load_config(self.path)["telegram"], {
             "admin_user_id": None, "repository": None, "business_enabled": False,

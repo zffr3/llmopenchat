@@ -37,6 +37,7 @@ from .runtime import ManagedServer, RuntimeErrorDetail
 from .terminal import terminal_text
 from .lifecycle import termination_signals
 from .telegram import run_telegram
+from .vision import content_text
 
 console = Console(highlight=False)
 
@@ -181,7 +182,7 @@ def chat(config: dict, root: Path, resumed_messages: list[dict] | None = None,
         say(f"Загружено сообщений: {len(messages)}. Продолжение сохранится отдельным диалогом.")
         for message in [m for m in messages if m["role"] != "system"][-6:]:
             label = {"user": "Вы", "tool": "Инструмент"}.get(message["role"], "GLM")
-            content = message["content"]
+            content = content_text(message["content"])
             say(f"{label} > {content[:600]}" + ("…" if len(content) > 600 else ""))
     client = ApiClient(config)
     show_reasoning = bool(config.get("show_reasoning"))
