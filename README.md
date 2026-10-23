@@ -86,7 +86,9 @@ sudo journalctl -u llmopenchat-telegram -f
 
 ## Быстрый запуск в Windows
 
-Нужен Python **3.10 или новее**; клиент проверяется на Python 3.12. Автоматический установщик локального сервера предназначен для Windows x64. Для Vulkan нужен совместимый видеодрайвер; объём RAM, VRAM и свободного диска зависит от выбранной модели.
+Клиент работает на Python **3.10 или новее**. Автоматический установщик Python и локального сервера предназначен для Windows x64. Для Vulkan нужен совместимый видеодрайвер; объём RAM, VRAM и свободного диска зависит от выбранной модели.
+
+`Install.cmd` ищет подходящий Python через `py -3`, `python`, `python3` и реестр Windows; отдельный launcher `py` необязателен. Если Python не найден, скрипт автоматически скачивает [Python 3.13.17 x64](https://www.python.org/downloads/release/python-31317/) с официального сайта, проверяет SHA256 и устанавливает его для текущего пользователя в `%LOCALAPPDATA%\Programs\Python\Python313`. Права администратора и перезапуск терминала не нужны. Python не добавляется в PATH; проект использует собственное окружение `.venv`. Для установки необходим доступ к интернету. Журнал установщика Python сохраняется в `.local/logs/python-install.log`; при ошибке повторно запустите `Install.cmd`.
 
 Из каталога проекта запустите:
 
@@ -112,7 +114,7 @@ sudo journalctl -u llmopenchat-telegram -f
 Для внешнего сервера подготовьте только окружение Python:
 
 ```powershell
-py -3 -m venv .venv
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap-python.ps1
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
 Copy-Item -LiteralPath config.example.json -Destination config.json
 ```

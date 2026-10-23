@@ -1,9 +1,9 @@
 @echo off
-setlocal
+setlocal DisableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-    py -3 -m venv .venv
+    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\bootstrap-python.ps1" -ProjectRoot "%~dp0."
     if errorlevel 1 goto failed
 )
 ".venv\Scripts\python.exe" -m pip install -r requirements.lock.txt
